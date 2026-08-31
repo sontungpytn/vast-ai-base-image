@@ -1,0 +1,549 @@
+# .github/workflows/build-vllm.yml
+# Required repository secrets:
+#   DOCKERHUB_USERNAME
+#   DOCKERHUB_TOKEN
+#   DOCKERHUB_NAMESPACE          - production namespace (final multi-arch index lives here)
+#   DOCKERHUB_NAMESPACE_STAGING  - staging namespace (per-arch build artifacts live here)
+# Optional: SLACK_WEBHOOK_URL
+#
+# Multi-arch strategy: each (variant, arch) pair builds natively on the
+# matching runner (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64) and
+# pushes an arch-suffixed tag to the STAGING namespace. A per-variant merge
+# job then uses crane to assemble the multi-arch index at the PRODUCTION tag.
+# No QEMU emulation.
+
+name: Build vLLM Image
+
+on:
+  schedule:
+    # Run every 12 hours
+    - cron: '0 0,12 * * *'
+
+  workflow_dispatch:
+    inputs:
+      VLLM_VERSION:
+        description: "vLLM version (e.g. v0.14.0, or 'nightly') - leave empty for latest"
+        required: false
+      DOCKERHUB_REPO:
+        description: "Push to username/<repo>"
+        required: true
+        default: "vllm"
+      CUSTOM_IMAGE_TAG:
+        description: "Custom tag (Auto default)"
+        required: false
+
+env:
+  DEFAULT_DOCKERHUB_REPO: "vllm"
+  # 12 hours
+  RELEASE_AGE_THRESHOLD: 43200
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.decision.outputs.should-run }}
+      vllm-version: ${{ steps.nightly-check.outputs.is-nightly == 'true' && steps.nightly-check.outputs.version || steps.release-check.outputs.resolved-version }}
+      build-matrix: ${{ steps.expand.outputs.build-matrix }}
+      merge-matrix: ${{ steps.expand.outputs.merge-matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for required secrets
+        id: secrets
+        run: |
+          missing=()
+          [[ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]] && missing+=("DOCKERHUB_USERNAME")
+          [[ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]] && missing+=("DOCKERHUB_TOKEN")
+          [[ -z "${{ secrets.DOCKERHUB_NAMESPACE }}" ]] && missing+=("DOCKERHUB_NAMESPACE")
+          [[ -z "${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}" ]] && missing+=("DOCKERHUB_NAMESPACE_STAGING")
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "Required secrets configured"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::notice::Skipping - missing secrets: ${missing[*]}"
+          fi
+
+      - name: Handle nightly build
+        id: nightly-check
+        if: inputs.VLLM_VERSION == 'nightly'
+        run: |
+          echo "is-nightly=true" >> $GITHUB_OUTPUT
+          echo "version=nightly-$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          # Upstream flipped the default CUDA on nightlies: the bare "nightly"
+          # tag is now the CUDA 13.0 image, and the 12.9 variant moved to the
+          # "cu129-nightly" PREFIX tag (unlike releases, which suffix -cu129).
+          # Build both so nightly matches the release matrix's CUDA coverage.
+          echo 'matrix=[{"tag":"nightly","cuda":"13.0"},{"tag":"cu129-nightly","cuda":"12.9"}]' >> $GITHUB_OUTPUT
+          echo "Nightly build requested - skipping version matching"
+
+      - name: Check release and resolve version
+        id: release-check
+        if: inputs.VLLM_VERSION != 'nightly'
+        uses: ./.github/actions/check-dockerhub-release
+        with:
+          repository: vllm/vllm-openai
+          version-pattern: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+          age-threshold-seconds: ${{ env.RELEASE_AGE_THRESHOLD }}
+          trigger: ${{ github.event_name }}
+          manual-version: ${{ inputs.VLLM_VERSION }}
+
+      - name: Build matrix from variant tags
+        id: build-matrix
+        if: inputs.VLLM_VERSION != 'nightly' && steps.release-check.outputs.new-release == 'true'
+        run: |
+          VERSION="${{ steps.release-check.outputs.resolved-version }}"
+
+          echo "Building matrix for version: $VERSION"
+
+          # Write to temp file first to avoid shell interpolation issues
+          cat << 'VARIANTS_EOF' > /tmp/variants.json
+          ${{ steps.release-check.outputs.variant-tags }}
+          VARIANTS_EOF
+
+          VARIANTS=$(cat /tmp/variants.json)
+          echo "Available variants: $VARIANTS"
+
+          # Convert variant tags to build matrix.
+          # Prefer explicit -cuNNN suffixes. As of v0.20.1 vLLM stopped
+          # publishing -cu130 entirely, so the unsuffixed base tag now IS
+          # the CUDA 13.0 image. Treat the bare $VERSION tag as CUDA 13.0
+          # only when no explicit -cu130 variant exists, so older releases
+          # that still ship both don't produce duplicate CUDA 13.0 builds.
+          MATRIX=$(echo "$VARIANTS" | jq -c --arg version "$VERSION" '
+            map(
+              # Skip arch-specific tags (we use multi-arch builds)
+              select(test("-(x86_64|aarch64)") | not)
+              # Skip ubuntu2404 (and any other non-CUDA) variants
+              | select(test("-ubuntu") | not)
+            )
+            | . as $variants
+            | ($variants | any(endswith("-cu130"))) as $has_cu130
+            | $variants
+            | map(
+              if endswith("-cu130") then
+                {tag: ., cuda: "13.0"}
+              elif endswith("-cu129") then
+                {tag: ., cuda: "12.9"}
+              elif endswith("-cu128") then
+                {tag: ., cuda: "12.8"}
+              elif . == $version and ($has_cu130 | not) then
+                {tag: ., cuda: "13.0"}
+              else
+                empty
+              end
+            )
+          ')
+
+          echo "Build matrix: $MATRIX"
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+          MATRIX_SIZE=$(echo "$MATRIX" | jq 'length')
+          if [[ "$MATRIX_SIZE" -eq 0 ]]; then
+            echo "::error::No valid image variants found for $VERSION"
+            exit 1
+          fi
+
+          echo "Will build $MATRIX_SIZE image(s)"
+
+      - name: Determine if build should run
+        id: decision
+        run: |
+          SECRETS="${{ steps.secrets.outputs.available }}"
+
+          if [[ "${{ steps.nightly-check.outputs.is-nightly }}" == "true" ]]; then
+            if [[ "$SECRETS" == "true" ]]; then
+              echo "should-run=true" >> $GITHUB_OUTPUT
+              echo "Building nightly"
+            else
+              echo "should-run=false" >> $GITHUB_OUTPUT
+              echo "::notice::Skipping - Required secrets not configured"
+            fi
+            exit 0
+          fi
+
+          NEW_RELEASE="${{ steps.release-check.outputs.new-release }}"
+          MATRIX='${{ steps.build-matrix.outputs.matrix }}'
+          MATRIX_SIZE=$(echo "${MATRIX:-[]}" | jq 'length // 0')
+
+          if [[ "$SECRETS" == "true" && "$NEW_RELEASE" == "true" && "$MATRIX_SIZE" -gt 0 ]]; then
+            echo "should-run=true" >> $GITHUB_OUTPUT
+            echo "Building $MATRIX_SIZE image(s) for ${{ steps.release-check.outputs.resolved-version }}"
+          else
+            echo "should-run=false" >> $GITHUB_OUTPUT
+
+            if [[ "$SECRETS" != "true" ]]; then
+              echo "::notice::Skipping - Required secrets not configured"
+            elif [[ "$NEW_RELEASE" != "true" ]]; then
+              echo "::notice::Skipping - No new release detected"
+            else
+              echo "::notice::Skipping - No valid image variants found"
+            fi
+          fi
+
+      - name: Expand matrix with arch axis
+        id: expand
+        if: steps.decision.outputs.should-run == 'true'
+        run: |
+          MERGE_MATRIX='${{ steps.nightly-check.outputs.is-nightly == 'true' && steps.nightly-check.outputs.matrix || steps.build-matrix.outputs.matrix }}'
+
+          # Cross-product the variants matrix with native-runner arch entries.
+          # Each build job pulls matrix.arch.{platform,suffix,runs_on}.
+          ARCHES_JSON='[
+            {"platform": "linux/amd64", "suffix": "amd64", "runs_on": "ubuntu-latest"},
+            {"platform": "linux/arm64", "suffix": "arm64", "runs_on": "ubuntu-24.04-arm"}
+          ]'
+          BUILD_MATRIX=$(echo "$MERGE_MATRIX" | jq -c --argjson arches "$ARCHES_JSON" '
+            [.[] as $v | $arches[] as $a | $v + {arch: $a}]
+          ')
+
+          echo "Merge matrix: $MERGE_MATRIX"
+          echo "Build matrix: $BUILD_MATRIX"
+
+          echo "merge-matrix=$MERGE_MATRIX" >> $GITHUB_OUTPUT
+          echo "build-matrix=$BUILD_MATRIX" >> $GITHUB_OUTPUT
+
+  build:
+    needs: preflight
+    if: needs.preflight.outputs.should-run == 'true'
+    runs-on: ${{ matrix.arch.runs_on }}
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.preflight.outputs.build-matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        uses: ./.github/actions/maximize-build-space
+
+      - name: Derive staging tag
+        run: |
+          VERSION="${{ needs.preflight.outputs.vllm-version }}"
+          VLLM_BASE="vllm/vllm-openai:${{ matrix.tag }}"
+          DOCKERHUB_REPO="${{ inputs.DOCKERHUB_REPO || env.DEFAULT_DOCKERHUB_REPO }}"
+
+          IMAGE_TAG_BASE="${{ inputs.CUSTOM_IMAGE_TAG }}"
+          if [[ -z "$IMAGE_TAG_BASE" ]]; then
+            IMAGE_TAG_BASE="$VERSION"
+          fi
+
+          # Format: v0.14.0-cuda-12.9
+          IMAGE_TAG="${IMAGE_TAG_BASE}-cuda-${{ matrix.cuda }}"
+          STAGING_TAG_BASE="${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+
+          echo "VLLM_BASE=$VLLM_BASE" >> $GITHUB_ENV
+          echo "STAGING_TAG_BASE=$STAGING_TAG_BASE" >> $GITHUB_ENV
+
+          echo "Building from: $VLLM_BASE (arch=${{ matrix.arch.suffix }})"
+
+      - name: Build and push arch image to staging
+        uses: ./.github/actions/build-arch-image
+        with:
+          context: external/vllm
+          arch: ${{ matrix.arch.platform }}
+          tag-base: ${{ env.STAGING_TAG_BASE }}
+          build-args: |
+            VLLM_BASE=${{ env.VLLM_BASE }}
+          build-contexts: |
+            base_image_source=.
+          dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # Live-GPU QA gate (ADR 0005) — calls the reusable qa-gate.yml once per
+  # promoted variant (amd64), gating the prod manifest merge. Per-image specifics
+  # (the {tag,cuda} matrix, the staging tag, the QA template, the label) are here;
+  # the shared core + account concurrency group live in qa-gate.yml. amd64-only;
+  # advisory until VAST_API_KEY exists.
+  qa:
+    needs: [preflight, build]
+    if: needs.preflight.outputs.should-run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.preflight.outputs.merge-matrix) }}
+    uses: ./.github/workflows/qa-gate.yml
+    with:
+      repo: ${{ inputs.DOCKERHUB_REPO || 'vllm' }}
+      tag: ${{ inputs.CUSTOM_IMAGE_TAG || needs.preflight.outputs.vllm-version }}-cuda-${{ matrix.cuda }}-amd64
+      template_dir: external/vllm/templates/vllm-qa
+      label: base-image-qa-vllm
+      log_paths: "/var/log/portal/vllm.log /var/log/portal/ray.log"
+      # CI-side half of the template's INSTANCE_TEST_REQUIRE_PASS (ADR 0019/0031).
+      # Declared in BOTH places on purpose: the runner enforces it in-instance, and
+      # this enforces it against the verdict payload, so a template edit that drops
+      # the env var still cannot produce a passing gate.
+      require_tests: "base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries vllm.d/10-vllm-serving vllm.d/12-vllm-contract"
+      # ADR 0029 condition 5: the redraw rule is not forked per image. This gate ran
+      # retries: 0 while base and pytorch ran 2, so a bad host red here blocked a
+      # promote that the same image would have survived on any other image's gate.
+      # A real defect still blocks — it fails every draw — and each failed attempt
+      # records its machine and excludes it from the next.
+      retries: 2
+    secrets:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      DOCKERHUB_NAMESPACE_STAGING: ${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Serverless cell (ADR 0031 decision 3). An ordinary on-demand rental that differs
+  # from the standard cells ONLY by SERVERLESS=true and the worker env that entails —
+  # the autoscaler path itself is out of scope; what this gates is the instance-side
+  # behaviour that setting the flag produces. Until this ran, vllm.d/20-serverless-pyworker
+  # and base/85-serverless-services had executed ZERO times, anywhere: no template set
+  # SERVERLESS=true (ADR 0006, deferred pending ADR 0019's fail-not-skip work, which
+  # has landed).
+  #
+  # EVERY CUDA VARIANT, same matrix as the standard cells. ADR 0031 decision 3
+  # originally specified ONE serverless cell on the argument that the serverless
+  # delta — worker wiring and the service overlay — is orthogonal to the CUDA minor.
+  # That argument is sound and it is not the whole question: an image is promoted per
+  # variant, so a variant whose serverless mode was never booted is promoted on an
+  # inference, and "orthogonal" is exactly the kind of assumption a gate exists to
+  # stop us making. The extra GPU cell per variant is a deliberate, accepted cost.
+  #
+  # It also removes a quieter defect. The single cell derived its tag from
+  # `fromJson(merge-matrix)[0].cuda` — the FIRST matrix entry, positional rather than
+  # chosen. Which variant serverless got tested on was therefore decided by matrix
+  # ordering, and a reordering upstream would have silently moved it with nothing
+  # announcing the change. Running the whole matrix makes the question moot.
+  #
+  # SAME TEMPLATE AS THE STANDARD CELL, by override. A second template file would be
+  # the obvious way to express "a second cell" and it is the wrong one: the two would
+  # drift, and the only difference that matters would stop being visible in the diff.
+  #
+  # IT DOES NOT GATE YET, and that is the ADR 0006 condition 2 ramp, not an oversight.
+  # `merge-manifests` DOES list this job in `needs` — that orders it ahead of the
+  # production approval prompt, so a human is never asked to approve before this
+  # cell's evidence exists — but its `if` deliberately does not require the result,
+  # so a red here alerts (qa-gate fires a per-cell Slack alert) without blocking a
+  # promote. Ordering and blocking are separate; only the second is being ramped.
+  # Promoting it to gating means adding `needs.qa-serverless.result == 'success'` to
+  # that `if`, after two consecutive green runs.
+  qa-serverless:
+    needs: [preflight, build]
+    if: needs.preflight.outputs.should-run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.preflight.outputs.merge-matrix) }}
+    uses: ./.github/workflows/qa-gate.yml
+    with:
+      repo: ${{ inputs.DOCKERHUB_REPO || 'vllm' }}
+      tag: ${{ inputs.CUSTOM_IMAGE_TAG || needs.preflight.outputs.vllm-version }}-cuda-${{ matrix.cuda }}-amd64
+      template_dir: external/vllm/templates/vllm-qa
+      label: base-image-qa-vllm-serverless
+      # The worker's own logs as well as the engine's: on this cell a failure is as
+      # likely to be the upstream bootstrap as the image, and ADR 0031 decision 5
+      # requires that the two be distinguishable from the run output alone.
+      log_paths: "/var/log/portal/vllm.log /var/log/portal/pyworker.log /workspace/pyworker.log /workspace/debug.log"
+      # THE ONLY PRODUCT DIFFERENCE FROM THE STANDARD CELL IS THE SERVERLESS SIGNALS.
+      # That is the whole claim of the serverless-enablement work — one template, no
+      # per-mode configuration — so a gate that quietly needed three more variables
+      # would not be testing it. (This cell supplies the autoscaler's signals rather
+      # than SERVERLESS=true; see the ADR 0034 note below.)
+      #
+      # MODEL_NAME is GONE and its absence is now part of the test. pyworker's
+      # core.py resolves the benchmark model from MODEL_NAME, VLLM_MODEL,
+      # SGLANG_MODEL or LLAMA_MODEL, precisely so an on-demand template that sets only
+      # the engine var works unchanged in serverless. The template sets the engine var,
+      # so passing MODEL_NAME here would paper over that resolution instead of
+      # exercising it. If it fails, the benchmark raises and 20-serverless-pyworker
+      # reds on a missing score — loudly, which is what we want.
+      #
+      # MODEL_LOG is GONE for the same reason: the worker's EngineDefaults already
+      # carry this engine's log path, and passing it tested our value rather than the
+      # image's.
+      #
+      # INSTANCE_TEST_REQUIRE_PASS stays, and is NOT a product difference. No customer
+      # template carries it — it is how the gate asserts, and the serverless cell has
+      # more tests that must have passed (base/85 and the pyworker score) because in
+      # this mode they are no longer inert. Keeping it here is the difference between
+      # QA scaffolding and the template's own configuration.
+      # THE AUTOSCALER'S OWN SIGNALS, NOT SERVERLESS=true (ADR 0034). This cell is now the
+      # only end-to-end proof of the inference: base's detection cells switch the mode but
+      # base has no engine, so nothing there shows a REAL worker starting and reaching a
+      # benchmark score under a mode the image inferred rather than was told.
+      #
+      # Both sentinels are self-evidently fake and safe in plaintext — the stage tests
+      # PRESENCE only and never reads either value, and .invalid cannot resolve.
+      #
+      # Every test named below can only pass if the image inferred the mode: they open
+      # with `is_serverless || test_skip`, and runner.sh turns a skipped REQUIRED test
+      # into REQUIRED-FAIL. So a broken inference is a red cell, not a quiet green.
+      #
+      # The EXPLICIT SERVERLESS=true path keeps its coverage on sglang and llama-cpp,
+      # whose serverless cells are unchanged — 9 of 10 published autoscaler templates
+      # still declare it, so that path must stay tested somewhere.
+      extra_env: |
+        MASTER_TOKEN=qa-detection-sentinel-not-a-real-token
+        REPORT_ADDR=https://qa-detection-sentinel.invalid
+        # UNSECURED skips the pubkey gate, and it undoes a QA-only side effect rather
+        # than weakening the test. REPORT_ADDR above is an unresolvable sentinel (L079),
+        # so `GET ${REPORT_ADDR}/pubkey/` CANNOT succeed — five attempts, then
+        # `backend_errored`, on every cell, always. The gate therefore proves nothing
+        # here: it is guaranteed to fail for a reason QA created, and skipping it masks
+        # nothing observable, because no configuration of ours could make it pass.
+        #
+        # What it costs without this: the worker benchmarks fine (`.has_benchmark` is
+        # written at backend.py:857, BEFORE the gate at :915 — which is why these cells
+        # were already green) and then dies at the last step, so every QA worker ends
+        # its life `errored` and each cell burns ~60s waiting for a key that cannot
+        # arrive. Measured on a live 2x5090 debug box: detection worked, sglang served,
+        # benchmark 995.55 written, then "Cannot mark model as loaded: pubkey fetch
+        # failed".
+        #
+        # SCOPE: QA scaffolding, and it must never reach a template — there it would
+        # disable request-signature verification on a live worker (__check_signature
+        # returns True immediately). It lives in extra_env precisely because a
+        # template.yml is what a production template gets copied from. Gated by L080.
+        UNSECURED=true
+        SERVERLESS_DETECT_EXPECT=detected
+        INSTANCE_TEST_REQUIRE_PASS=base/15-boot-markers base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries base/85-serverless-services vllm.d/10-vllm-serving vllm.d/12-vllm-contract vllm.d/20-serverless-pyworker
+      require_tests: "base/15-boot-markers base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries base/85-serverless-services vllm.d/10-vllm-serving vllm.d/12-vllm-contract vllm.d/20-serverless-pyworker"
+      retries: 2
+    secrets:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      DOCKERHUB_NAMESPACE_STAGING: ${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # start_server.sh: `[ -n "$BACKEND" ] && [ -z "$HF_TOKEN" ] && report_error_and_exit`.
+      # Read-only token — the worker only pulls the tiny QA model.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  merge-manifests:
+    # qa-serverless is in `needs` to ORDER it, and absent from the `if` so it cannot
+    # BLOCK. Those are two different things and only the first was wired before.
+    #
+    # Without the dependency, this job becomes eligible the moment `qa` finishes, so
+    # the production approval prompt can appear while the serverless cell is still
+    # running — a human would be approving before its evidence exists, which is the
+    # one thing the gate is for. With it, the prompt waits for the cell and the `if`
+    # below still promotes whatever that cell said (ADR 0031 decision 3's ramp).
+    #
+    # `!cancelled()` is what makes a FAILED qa-serverless not skip this job — but it
+    # also switches off the implicit "skip if any needed job failed", so the two
+    # results that must still block are named explicitly. Dropping either one would
+    # promote a broken image silently.
+    needs: [preflight, build, qa, qa-serverless]
+    if: >-
+      !cancelled()
+      && needs.preflight.outputs.should-run == 'true'
+      && needs.build.result == 'success'
+      && needs.qa.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.preflight.outputs.merge-matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive image tags
+        run: |
+          VERSION="${{ needs.preflight.outputs.vllm-version }}"
+          DOCKERHUB_REPO="${{ inputs.DOCKERHUB_REPO || env.DEFAULT_DOCKERHUB_REPO }}"
+
+          IMAGE_TAG_BASE="${{ inputs.CUSTOM_IMAGE_TAG }}"
+          if [[ -z "$IMAGE_TAG_BASE" ]]; then
+            IMAGE_TAG_BASE="$VERSION"
+          fi
+
+          IMAGE_TAG="${IMAGE_TAG_BASE}-cuda-${{ matrix.cuda }}"
+          STAGING_TAG_BASE="${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+          PROD_TAG="${{ secrets.DOCKERHUB_NAMESPACE }}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+
+          echo "STAGING_TAG_BASE=$STAGING_TAG_BASE" >> $GITHUB_ENV
+          echo "PROD_TAG=$PROD_TAG" >> $GITHUB_ENV
+
+          MATRIX_ID=$(echo "${{ matrix.tag }}" | md5sum | cut -c1-8)
+          echo "MATRIX_ID=$MATRIX_ID" >> $GITHUB_ENV
+
+      - name: Assemble multi-arch index in production
+        uses: ./.github/actions/merge-arch-manifests
+        with:
+          target-tag: ${{ env.PROD_TAG }}
+          source-tag-base: ${{ env.STAGING_TAG_BASE }}
+          dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Record merged manifest tag
+        run: |
+          mkdir -p built-tags
+          echo "${{ env.PROD_TAG }}" > built-tags/tag-${{ env.MATRIX_ID }}.txt
+
+      - name: Upload manifest tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-tag-${{ env.MATRIX_ID }}
+          path: built-tags/
+          retention-days: 1
+
+  collect-tags:
+    needs: [preflight, build, merge-manifests]
+    if: always() && needs.preflight.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      all-tags: ${{ steps.collect.outputs.tags }}
+    steps:
+      - name: Download all tag artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: built-tag-*
+          path: all-tags/
+          merge-multiple: true
+
+      - name: Aggregate tags
+        id: collect
+        run: |
+          if [[ -d all-tags ]] && [[ "$(ls -A all-tags 2>/dev/null)" ]]; then
+            TAGS=$(cat all-tags/*.txt | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "Found tags: $TAGS"
+          else
+            echo "::warning::No tags found - build may have failed"
+            TAGS="[]"
+          fi
+
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
+  notify:
+    needs: [preflight, build, qa, qa-serverless, merge-manifests, collect-tags]
+    if: always() && needs.preflight.outputs.should-run == 'true'
+    uses: ./.github/workflows/notify-slack.yml
+    with:
+      build-result: ${{ needs.merge-manifests.result }}
+      # Distinct failure labels via AGGREGATED .result (never matrix .outputs):
+      # build broke vs QA caught a bad image vs promotion (crane) failed. Empty on
+      # success -> notify-slack renders the default "✅ ... Successful". (Soft-pass
+      # is a separate ⚠️ alert fired per-cell inside qa-gate.yml.)
+      #
+      # The serverless clause sits AFTER promotion succeeded and says "promoted"
+      # first, because that cell does not gate yet: without it a red serverless cell
+      # marks the whole run failed while merge-manifests promoted the image, and the
+      # Slack line would read "promoted — QA passed" beside a failed run. Saying both
+      # is the honest report; hiding either is not. Delete this clause when the cell
+      # joins merge-manifests' `needs` and becomes blocking.
+      # "PROMOTED" IS AN ALLOWLIST ON merge-manifests SUCCEEDING, not a fall-through.
+      # This expression used to enumerate failure states and fall through to the
+      # success text keyed on `qa.outputs.gated` — "did a live test run" — which says
+      # nothing about whether anything shipped. `merge-manifests` ending 'skipped' or
+      # 'cancelled' is not 'failure', so it fell through and Slack announced a
+      # promotion that did not happen. Measured 2026-08-27: three branch dispatches
+      # cancelled at the production approval gate, every QA cell green, Slack saying
+      # "vLLM promoted — live-GPU QA passed" beside a red run card.
+      headline: ${{ (needs.build.result != 'success' && 'vLLM build failed') || (needs.qa.result == 'failure' && 'vLLM QA FAILED on real GPU — not promoted') || (needs.merge-manifests.result == 'failure' && 'vLLM promotion (manifest merge) failed') || (needs.merge-manifests.result != 'success' && 'vLLM NOT promoted — promotion did not run') || (needs.qa-serverless.result == 'failure' && 'vLLM promoted — but the ADVISORY serverless cell FAILED (not gating yet)') || (needs.qa.outputs.gated == 'true' && 'vLLM promoted — live-GPU QA passed') || '' }}
+      image-name: "vLLM"
+      image-ref: ${{ needs.preflight.outputs.vllm-version }}
+      image-tags: ${{ needs.collect-tags.outputs.all-tags }}
+      trigger: ${{ github.event_name }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

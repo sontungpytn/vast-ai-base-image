@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Provisioning should not complete if there is an error. Retry on reboot if it failed
-set -eou pipefail
+set -euo pipefail
 
 # Allow user to fetch alternative repo, branch, tag, commit
 export APP_REPO_URL=${APP_REPO_URL:-https://github.com/cocktailpeanut/fluxgym}
@@ -21,7 +21,7 @@ cd "${WORKSPACE}"
 (cd "${INSTALL_DIR}/sd-scripts" && uv pip install -r requirements.txt)
 
 # Flux Gym requirements
-(cd "${INSTALL_DIR}" && uv pip install torch torchvision torchaudio bitsandbytes -r requirements.txt --torch-backend=auto)
+(cd "${INSTALL_DIR}" && uv pip install torch torchvision torchaudio bitsandbytes -r requirements.txt peft'<0.18' --torch-backend cu128)
 uv pip install transformers==4.49.0
 # Generate the launch script for supervisord
 cat > /opt/supervisor-scripts/fluxgym.sh << 'EOL'

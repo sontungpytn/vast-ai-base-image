@@ -7,35 +7,46 @@ LABEL org.opencontainers.image.source="https://github.com/vastai/"
 LABEL org.opencontainers.image.description="PyTorch image suitable for Vast.ai."
 LABEL maintainer="Vast.ai Inc <contact@vast.ai>"
 
-# Copy Supervisor configuration and startup scripts
+# Overlay: derivative tests
 COPY ./ROOT /
 
 # Required or we will not build - Store for use in derivative images
 ARG PYTORCH_VERSION
 ENV PYTORCH_VERSION=${PYTORCH_VERSION}
-ARG PYTORCH_INDEX_URL
-ENV PYTORCH_INDEX_URL=${PYTORCH_INDEX_URL}
+ARG PYTORCH_BACKEND
+ENV PYTORCH_BACKEND=${PYTORCH_BACKEND}
 
 ARG VAST_BASE
+ARG TARGETARCH
+COPY ./torch-companions.json /tmp/torch-companions.json
 RUN \
     set -euo pipefail && \
     [[ -n "${PYTORCH_VERSION}" ]] || { echo "Must specify PYTORCH_VERSION" && exit 1; } && \
-    [[ -n "${PYTORCH_INDEX_URL}" ]] || { echo "Must specify PYTORCH_INDEX_URL" && exit 1; } && \
+    [[ -n "${PYTORCH_BACKEND}" ]] || { echo "Must specify PYTORCH_BACKEND" && exit 1; } && \
+    [[ "${PYTORCH_BACKEND}" != "auto" ]] || { echo "Cannot use 'auto' as torch backend during build" && exit 1; } && \
     # Activate the venv
     . /venv/main/bin/activate && \
-    uv pip install \
-        torch==${PYTORCH_VERSION} \
-        torchvision \
-        torchaudio \
-        --index-url ${PYTORCH_INDEX_URL} && \
-    # Numpy 2.x is only supported in PyTorch versions > 2.1
+    # Look up pinned companion versions from JSON, filtering amd64-only packages on other arches
+    COMPANIONS=$(jq -r --arg v "${PYTORCH_VERSION}" --arg arch "${TARGETARCH}" 'if .[$v] == null then error("version not found") else . end | (.[$v].amd64_only // []) as $excl | .[$v].packages | to_entries | if $arch != "amd64" then map(select(.key as $k | $excl | index($k) | not)) else . end | map(.key + "==" + .value) | .[]' /tmp/torch-companions.json | tr '\n' ' ') && \
+    PACKAGES="torch==${PYTORCH_VERSION} ${COMPANIONS}" && \
+    echo "Installing: ${PACKAGES}" && \
+    uv pip install --no-cache-dir ${PACKAGES} --torch-backend ${PYTORCH_BACKEND} && \
+    # Pin numpy<2 for PyTorch <=2.1 to prevent compatibility issues.
+    # NumPy 2.0 introduced breaking ABI changes that cause crashes with older PyTorch.
+    # Without this pin, users could accidentally upgrade numpy and break their environment.
     major=$(echo "$PYTORCH_VERSION" | awk -F. '{print $1}') && \
     minor=$(echo "$PYTORCH_VERSION" | awk -F. '{print $2}') && \
     if (( major < 2 || (major == 2 && minor <= 1) )); then \
-        pip install numpy'<'2; \
+        pip install 'numpy<2'; \
     fi && \
-    # Test 1: Verify PyTorch version (using startswith to handle CUDA/ROCm suffixes)
-    python3 -c "import torch; assert torch.__version__.startswith('${PYTORCH_VERSION}'), f'Version mismatch: expected version starting with ${PYTORCH_VERSION}, got {torch.__version__}'" && \
+    # Test 1: Verify installed package versions match expected pins
+    python3 -c "import torch; assert torch.__version__.startswith('${PYTORCH_VERSION}'), f'torch: expected ${PYTORCH_VERSION}, got {torch.__version__}'" && \
+    for spec in ${COMPANIONS}; do \
+        pkg="${spec%%==*}" && ver="${spec#*==}" && \
+        actual=$(python3 -c "from importlib.metadata import version; print(version('${pkg}'))") && \
+        [[ "${actual}" == "${ver}"* ]] || { echo "${pkg}: expected ${ver}, got ${actual}" && exit 1; } && \
+        echo "${pkg}==${actual} OK"; \
+    done && \
     # Test 2: Check for correct backend based on base image
     if [[ "${VAST_BASE}" == *"cuda"* ]]; then \
         python3 -c "import torch; assert torch.backends.cuda.is_built(), 'CUDA support not found in PyTorch build'" && \
@@ -47,7 +58,8 @@ RUN \
     # Test 3: Basic tensor operations
     python3 -c "import torch; x = torch.rand(2,3); y = torch.rand(2,3); z = torch.mm(x, y.t()); assert z.shape == (2,2), 'Basic tensor operations failed'" && \
     # Test 4: Simple neural network instantiation and forward pass
-    python3 -c "import torch; model = torch.nn.Linear(10,2); x = torch.randn(5,10); y = model(x); assert y.shape == (5,2) and not torch.isnan(y).any(), 'Neural network test failed'"
+    python3 -c "import torch; model = torch.nn.Linear(10,2); x = torch.randn(5,10); y = model(x); assert y.shape == (5,2) and not torch.isnan(y).any(), 'Neural network test failed'" && \
+    rm -f /tmp/torch-companions.json
 
 # Defend against environment clashes when syncing to volume
 RUN \

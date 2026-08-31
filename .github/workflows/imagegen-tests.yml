@@ -1,0 +1,154 @@
+# Unit-test gate for the imagegen tooling (invariant linter + generator + QA
+# launcher) and the template_manager helpers it shells out to. This is the fast
+# CI that keeps the linter/generator honest — the live-GPU QA gate (qa-gate.yml,
+# ADR 0005) is a separate, per-image correctness gate. See docs/adr/0001.
+name: imagegen tests
+
+on:
+  pull_request:
+    paths:
+      - "tools/imagegen/**"
+      - "tools/template_manager/**"
+      - ".github/workflows/imagegen-tests.yml"
+      # The guard tests are worthless if they do not run on the PR that edits what
+      # they guard: a change to the promote workflow or the in-instance harness is
+      # exactly the edit that could disarm the gate.
+      #
+      # ALL of them, not an enumeration. test_promote_notification_truth.py reads
+      # every caller of notify-slack.yml, so a PR touching only build-vllm.yml's
+      # headline has to run it — and under the four-file list it did not, which is
+      # how a cancelled run came to announce "vLLM promoted — live-GPU QA passed"
+      # (2026-08-27). The list was this repo's own recurring defect one level up:
+      # the case nobody enumerated goes unguarded.
+      - ".github/workflows/**"
+      - "ROOT/opt/instance-tools/tests/**"
+      # L069 scans the derivative and external suites too, so a PR that adds a
+      # test there must run the rule that governs it.
+      - "derivatives/**/ROOT/opt/instance-tools/tests/**"
+      - "external/**/ROOT/opt/instance-tools/tests/**"
+      # L069 reads the supervisord program list from this directory, so adding a
+      # program changes what the rule covers.
+      - "ROOT/etc/supervisor/conf.d/**"
+      # The provisioner suite is a CI gate now, so the PR that edits the
+      # provisioner has to run it.
+      - "ROOT/opt/instance-tools/lib/provisioner/**"
+      # cuda-driver-version and the boot script that calls it are covered by
+      # test_cuda_driver_version.py and by L063/L064 — the tests are worthless
+      # if they do not run on the PR that edits what they guard.
+      - "ROOT/opt/instance-tools/bin/**"
+      - "ROOT/etc/vast_boot.d/**"
+      # The portal ships inside the image (COPY ./portal-aio) and is linted by
+      # L066 alongside the boot script and the test that share its cert
+      # predicate — the rule is worthless if the PR that edits one of the three
+      # does not run it.
+      - "portal-aio/**"
+      - "configs/**"
+      - "templates/**"
+  push:
+    branches: [main]
+    paths:
+      - "tools/imagegen/**"
+      - "tools/template_manager/**"
+      - ".github/workflows/imagegen-tests.yml"
+      # The guard tests are worthless if they do not run on the PR that edits what
+      # they guard: a change to the promote workflow or the in-instance harness is
+      # exactly the edit that could disarm the gate.
+      #
+      # ALL of them, not an enumeration. test_promote_notification_truth.py reads
+      # every caller of notify-slack.yml, so a PR touching only build-vllm.yml's
+      # headline has to run it — and under the four-file list it did not, which is
+      # how a cancelled run came to announce "vLLM promoted — live-GPU QA passed"
+      # (2026-08-27). The list was this repo's own recurring defect one level up:
+      # the case nobody enumerated goes unguarded.
+      - ".github/workflows/**"
+      - "ROOT/opt/instance-tools/tests/**"
+      # L069 scans the derivative and external suites too, so a PR that adds a
+      # test there must run the rule that governs it.
+      - "derivatives/**/ROOT/opt/instance-tools/tests/**"
+      - "external/**/ROOT/opt/instance-tools/tests/**"
+      # L069 reads the supervisord program list from this directory, so adding a
+      # program changes what the rule covers.
+      - "ROOT/etc/supervisor/conf.d/**"
+      # The provisioner suite is a CI gate now, so the PR that edits the
+      # provisioner has to run it.
+      - "ROOT/opt/instance-tools/lib/provisioner/**"
+      # cuda-driver-version and the boot script that calls it are covered by
+      # test_cuda_driver_version.py and by L063/L064 — the tests are worthless
+      # if they do not run on the PR that edits what they guard.
+      - "ROOT/opt/instance-tools/bin/**"
+      - "ROOT/etc/vast_boot.d/**"
+      # The portal ships inside the image (COPY ./portal-aio) and is linted by
+      # L066 alongside the boot script and the test that share its cert
+      # predicate — the rule is worthless if the PR that edits one of the three
+      # does not run it.
+      - "portal-aio/**"
+      - "configs/**"
+      - "templates/**"
+
+jobs:
+  # The gated invariants are only invariants if something checks them. Until this
+  # job existed, `imagegen lint --all` ran on developer machines only: every RULES
+  # code was enforced by habit, and the two mutation tests touched the real tree
+  # incidentally at best. A rule CI never runs is documentation.
+  lint-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: imagegen lint --all
+        run: PYTHONPATH=tools/imagegen python -m imagegen.cli lint --all
+      - name: docs/lint-rules.md is regenerated from RULES
+        run: |
+          PYTHONPATH=tools/imagegen python -m imagegen.cli rules > /tmp/rules.md
+          diff -u docs/lint-rules.md /tmp/rules.md \
+            || { echo "::error::docs/lint-rules.md is stale — run: imagegen rules > docs/lint-rules.md"; exit 1; }
+
+  imagegen-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # imagegen's own runtime dep (pyyaml) + pytest; plus the template_manager
+          # deps the qa-launcher tests exercise (dotenv/pydantic), so _check_deps
+          # takes its clean path rather than the missing-deps branch.
+          pip install pytest pyyaml
+          pip install -r tools/template_manager/requirements.txt
+          # The provisioner's own requirements, so the hf CLI contract test runs
+          # against the SAME version range the image installs. Without this it
+          # skips, and a skipped contract test is a contract nobody is checking.
+          pip install -r ROOT/opt/instance-tools/lib/provisioner/requirements.txt
+      # Includes three docker-backed functional gates (cuda-driver-version, the
+      # TLS cert boot script, and the provisioner self-test). They dominate the
+      # runtime of this job — each needs a throwaway root because the thing under
+      # test is absolute paths and persistent state, not a pure function. Each
+      # module also carries a `test_docker_is_available_under_ci` that FAILS
+      # (a single named red, not a session-wide collection abort) when CI is set
+      # and docker is absent — a skip is not a pass. Set ALLOW_DOCKERLESS_TESTS=1
+      # to opt out deliberately. On ubuntu-latest docker is present.
+      - name: Run imagegen test suite
+        working-directory: tools/imagegen
+        run: python -m pytest -q
+      # Collection is rooted at working-directory, so the template_manager suite
+      # needs its own invocation — without it, these tests (including
+      # test_qa_gate_floor_guard.py, the pre-merge guard ADR 0005 relies on)
+      # never ran in CI despite the paths filter above (ADR 0019 condition 1).
+      - name: Run template_manager test suite
+        run: python -m pytest -q tools/template_manager
+      # The provisioner ships 18 test files and, until this step, NOTHING ran
+      # them — not this workflow, not any other. 450+ tests covering URL
+      # classification, retry/backoff, civitai token scoping, manifest schema,
+      # dedup and state, all green, all dead. They take ~2s.
+      #
+      # Rooted at lib/ because the package is imported as `provisioner`, which is
+      # how ROOT/opt/instance-tools/bin/provisioner puts it on PYTHONPATH.
+      - name: Run provisioner test suite
+        working-directory: ROOT/opt/instance-tools/lib
+        run: python -m pytest -q provisioner/tests

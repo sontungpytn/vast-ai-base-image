@@ -1,0 +1,153 @@
+"""Generic download handler.
+
+Handles plain HTTP downloads with wget, and authenticated CivitAI downloads with
+curl — CivitAI 307s to a presigned CDN host, and wget re-sends --header across that
+host change (leaking the token) while curl drops it.
+Supports content-disposition filename extraction when dest ends with '/'.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+from urllib.parse import urlparse
+
+from ..concurrency import FileLock
+from ..subprocess_runner import run_cmd
+from ..schema import DownloadEntry, RetrySettings
+from .base import retry_with_backoff
+
+log = logging.getLogger("provisioner")
+
+
+def _get_content_disposition_filename(url: str, auth_header: str | None = None) -> str:
+    """Fetch the filename from Content-Disposition headers."""
+    # CivitAI's download endpoint mishandles auth on HEAD requests, 401ing
+    # even with a token that downloads the same file fine via GET. Use a
+    # ranged GET (-r 0-0, 1 byte) instead, for CivitAI only.
+    if _is_civitai(url):
+        cmd = ["curl", "-sD", "-", "-o", "/dev/null", "-L", "-r", "0-0", "--max-time", "30", url]
+    else:
+        cmd = ["curl", "-sI", "-L", "--max-time", "30", url]
+    if auth_header:
+        cmd.extend(["-H", auth_header])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    for line in result.stdout.splitlines():
+        if "content-disposition" in line.lower():
+            # Extract filename from: Content-Disposition: ... filename="file.ext"
+            for part in line.split(";"):
+                part = part.strip()
+                if part.lower().startswith("filename="):
+                    fname = part.split("=", 1)[1].strip().strip('"').strip("'")
+                    return os.path.basename(fname)
+    return ""
+
+
+def _is_civitai(url: str) -> bool:
+    """True only for real CivitAI hosts over HTTPS.
+
+    This decides whether the user's CivitAI token is attached, so a substring
+    test is not good enough: manifests are third-party data (PROVISIONING_SCRIPT
+    fetches one by URL, PROVISIONING_DOWNLOADS accepts url|path pairs), and
+    "civitai.com" appears in a path, a subdomain suffix or a query string of a
+    URL an attacker controls — e.g. https://evil.example/civitai.com/x or
+    https://civitai.com.evil.example/x — each of which would hand over the token.
+    Matching on the parsed host also rules out http://, which would put the
+    bearer token on the wire in cleartext.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "civitai.com" or host.endswith(".civitai.com"))
+
+
+def download_wget(
+    entry: DownloadEntry,
+    retry: RetrySettings,
+    civitai_token: str = "",
+    dry_run: bool = False,
+) -> None:
+    """Download a file using wget.
+
+    For CivitAI URLs, adds Authorization header.
+    If dest ends with '/', uses content-disposition for filename.
+    File locking prevents concurrent downloads of the same file.
+    """
+    url = entry.url
+    dest = entry.dest
+    auth_header = ""
+
+    if _is_civitai(url) and civitai_token:
+        auth_header = f"Authorization: Bearer {civitai_token}"
+
+    # Resolve dest for content-disposition
+    use_content_disposition = dest.endswith("/")
+    if use_content_disposition:
+        dest_dir = dest.rstrip("/")
+        if not dry_run:
+            filename = _get_content_disposition_filename(url, auth_header or None)
+            if not filename:
+                # Fallback: use last URL path segment
+                filename = os.path.basename(url.split("?")[0]) or "download"
+                log.warning("Could not determine filename from headers, using: %s", filename)
+            dest = os.path.join(dest_dir, filename)
+        else:
+            dest = os.path.join(dest_dir, "<content-disposition>")
+
+    if dry_run:
+        log.info("[DRY RUN] Would download wget %s -> %s", url, dest)
+        return
+
+    with FileLock(dest):
+        if os.path.isfile(dest):
+            log.info("File already exists: %s (skipping)", dest)
+            return
+
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        def _do_download() -> bool:
+            if auth_header and _is_civitai(url):
+                # wget forwards --header to every redirect hop, including
+                # cross-host ones. CivitAI's download endpoint 307-redirects
+                # to a presigned CDN URL that 400s on any Authorization
+                # header; curl drops it automatically once the host changes.
+                cmd = [
+                    "curl", "-fSL", "--max-redirs", "10",
+                    "-H", auth_header,
+                    "-o", dest,
+                    url,
+                ]
+                label = "curl"
+            else:
+                cmd = [
+                    "wget", "-q", "--show-progress",
+                    "--max-redirect=10",
+                    "-O", dest,
+                    url,
+                ]
+                label = "wget"
+
+            result = run_cmd(cmd, label=label, check=False)
+            if result.returncode != 0:
+                # Clean up partial downloads
+                try:
+                    os.unlink(dest)
+                except OSError:
+                    pass
+                return False
+
+            if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                log.info("Successfully downloaded: %s", dest)
+                return True
+
+            return False
+
+        if not retry_with_backoff(
+            _do_download,
+            label=url,
+            max_attempts=retry.max_attempts,
+            initial_delay=retry.initial_delay,
+            backoff_multiplier=retry.backoff_multiplier,
+        ):
+            raise RuntimeError(f"Failed to download {url}")

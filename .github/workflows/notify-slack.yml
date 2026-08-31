@@ -1,0 +1,262 @@
+# .github/workflows/notify-slack.yml
+name: Slack Build Notification
+
+on:
+  workflow_call:
+    inputs:
+      build-result:
+        description: "Result of the build job"
+        required: true
+        type: string
+      image-name:
+        description: "Name of the image being built (e.g., ComfyUI, vLLM)"
+        required: true
+        type: string
+      image-ref:
+        description: "Version/ref being built"
+        required: true
+        type: string
+      image-tags:
+        description: "JSON array of image tags that were built"
+        required: true
+        type: string
+      trigger:
+        description: "What triggered the build"
+        required: true
+        type: string
+      run-url:
+        description: "URL to the workflow run"
+        required: true
+        type: string
+      status:
+        description: "Override render state: '' = derive ✅/❌ from build-result (default, back-compat); 'warning' = ⚠️ yellow (e.g. a QA soft-pass / ungated promotion)"
+        required: false
+        type: string
+        default: ""
+      headline:
+        description: "Override the header/fallback text (emoji is prepended). '' = default '<name> Image Build <Successful|Failed>'"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for Slack webhook
+        id: slack-check
+        run: |
+          if [[ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::notice::Slack webhook not configured - skipping notification"
+          fi
+
+      - name: Notify Slack
+        if: steps.slack-check.outputs.available == 'true'
+        env:
+          TRIGGER: ${{ inputs.trigger }}
+          IMAGE_REF: ${{ inputs.image-ref }}
+          RUN_URL: ${{ inputs.run-url }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          IMAGE_TAGS: ${{ inputs.image-tags }}
+          STATUS: ${{ inputs.status }}
+          HEADLINE: ${{ inputs.headline }}
+          BUILD_RESULT: ${{ inputs.build-result }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          # Three render states. `status: warning` is an explicit override (the QA
+          # soft-pass / ungated-promotion alert); otherwise derive ✅/❌ from
+          # build-result exactly as before — callers passing neither `status` nor
+          # `headline` render byte-identically to the original.
+          if [[ "$STATUS" == "warning" ]]; then
+            STATUS_EMOJI="⚠️"
+            STATUS_TEXT="Warning"
+            COLOR="warning"
+          elif [[ "$BUILD_RESULT" == "success" ]]; then
+            STATUS_EMOJI="✅"
+            STATUS_TEXT="Successful"
+            COLOR="good"
+          else
+            STATUS_EMOJI="❌"
+            STATUS_TEXT="Failed"
+            COLOR="danger"
+          fi
+
+          # Header/fallback text: a caller-supplied headline wins; else the default.
+          if [[ -n "$HEADLINE" ]]; then
+            HEADER_TEXT="${STATUS_EMOJI} ${HEADLINE}"
+          else
+            HEADER_TEXT="${STATUS_EMOJI} ${IMAGE_NAME} Image Build ${STATUS_TEXT}"
+          fi
+
+          # CLAMP THE HEADER. Slack's header block is plain_text with a hard 150
+          # character limit, and the whole POST is rejected with HTTP 400 if it is
+          # exceeded — the notification is lost entirely, including the part that
+          # says whether anything shipped.
+          #
+          # Observed 2026-08-19 (run 32239585814): promote-pytorch built a 527
+          # character headline enumerating the QA'd artifacts. The promotion had
+          # fully SUCCEEDED — every tag pushed — and the run still reported failure,
+          # because the only thing that broke was the announcement of the success.
+          #
+          # This file already truncates the tags section for its 3000 char limit.
+          # The header was never clamped, so any caller could break the shared
+          # notifier. Clamp here rather than only fixing the caller: this is the
+          # component that knows Slack's limits, and 29 workflows call it.
+          HEADER_OVERFLOW=""
+          if [[ ${#HEADER_TEXT} -gt 150 ]]; then
+            HEADER_OVERFLOW="$HEADER_TEXT"
+            # 147 + the ellipsis. Cut on a word boundary when one is near the end,
+            # so the header does not stop mid-token.
+            _cut="${HEADER_TEXT:0:147}"
+            # Cut on a word boundary ONLY when that does not cost most of the
+            # budget. The length test must be on the TRIMMED string: the first
+            # version tested ${#_cut}, which is always 147 here, so it was
+            # vacuously true — and a headline whose tail is a space-free list
+            # (a comma-joined tag list, say) trimmed back to the last space in
+            # the prose prefix. Measured: 194 chars in, 27 out.
+            _trim="${_cut% *}"
+            if [[ "$_trim" != "$_cut" && ${#_trim} -gt 120 ]]; then
+              _cut="$_trim"
+            fi
+            HEADER_TEXT="${_cut}…"
+            echo "::notice::headline was ${#HEADER_OVERFLOW} chars; clamped to Slack's 150 char header limit (full text moved into the message body)"
+          fi
+
+          # Show the promoted-tags block when something was promoted: a normal
+          # success, OR a soft-pass warning (ungated promotion — show the tags).
+          SHOW_TAGS="false"
+          if [[ "$BUILD_RESULT" == "success" || "$STATUS" == "warning" ]]; then
+            SHOW_TAGS="true"
+          fi
+
+          # Build base blocks
+          BLOCKS=$(jq -n \
+            --arg header "$HEADER_TEXT" \
+            --arg trigger "$TRIGGER" \
+            --arg ref "$IMAGE_REF" \
+            '[
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": $header,
+                  "emoji": true
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": ("*Trigger:*\n`" + $trigger + "`")
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": ("*Ref:*\n`" + $ref + "`")
+                  }
+                ]
+              }
+            ]')
+
+          # The clamped-away text is information, not decoration — put it back in
+          # the body, where the limit is 3000 rather than 150.
+          if [[ -n "$HEADER_OVERFLOW" ]]; then
+            BLOCKS=$(jq --arg full "${HEADER_OVERFLOW:0:2900}" \
+              '. + [{"type": "section",
+                     "text": {"type": "mrkdwn", "text": $full}}]' <<<"$BLOCKS")
+          fi
+          
+          # Add image tags when something was promoted (success or soft-pass warning)
+          if [[ "$SHOW_TAGS" == "true" ]]; then
+            # Filter out per-arch tags (keep only merged manifests) and format as code blocks
+            # Slack block text has a 3000 char limit, so we truncate with a count if needed
+            TOTAL_COUNT=$(echo "$IMAGE_TAGS" | jq 'length')
+            TAGS_TEXT=$(echo "$IMAGE_TAGS" | jq -r '
+              [.[] | select(test("-(amd64|arm64)$") | not)] |
+              sort |
+              [.[] | "`" + . + "`"] |
+              join("\n")')
+            SHOWN_COUNT=$(echo "$TAGS_TEXT" | grep -c '`' || true)
+
+            # Truncate to stay under Slack's 3000 char limit (leave room for header + overflow note)
+            if [[ ${#TAGS_TEXT} -gt 2800 ]]; then
+              TAGS_TEXT="${TAGS_TEXT:0:2800}"
+              # Trim to last complete line
+              TAGS_TEXT="${TAGS_TEXT%$'\n'*}"
+              SHOWN_COUNT=$(echo "$TAGS_TEXT" | grep -c '`' || true)
+              TAGS_TEXT="${TAGS_TEXT}"$'\n'"_...and more (${TOTAL_COUNT} total tags, ${SHOWN_COUNT} shown)_"
+            fi
+
+            SUCCESS_BLOCKS=$(jq -n \
+              --arg tags "$TAGS_TEXT" \
+              '[
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ("*Image Tags:*\n" + $tags)
+                  }
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "⚠️ *Recommended Template has not been modified.* Test new images before setting the default tag."
+                  }
+                }
+              ]')
+            BLOCKS=$(echo "$BLOCKS" | jq --argjson success "$SUCCESS_BLOCKS" '. + $success')
+          fi
+          
+          # Add context block
+          CONTEXT_BLOCK=$(jq -n \
+            --arg url "$RUN_URL" \
+            '[{
+              "type": "context",
+              "elements": [{
+                "type": "mrkdwn",
+                "text": ("<" + $url + "|View workflow run>")
+              }]
+            }]')
+          BLOCKS=$(echo "$BLOCKS" | jq --argjson ctx "$CONTEXT_BLOCK" '. + $ctx')
+          
+          FALLBACK="${HEADER_TEXT} (${IMAGE_REF})"
+
+          PAYLOAD=$(jq -n \
+            --arg color "$COLOR" \
+            --arg fallback "$FALLBACK" \
+            --argjson blocks "$BLOCKS" \
+            '{
+              "attachments": [{
+                "color": $color,
+                "fallback": $fallback,
+                "blocks": $blocks
+              }]
+            }')
+          
+          # A FAILED ANNOUNCEMENT MUST NOT FAIL THE THING IT ANNOUNCES.
+          # On 2026-08-19 a fully successful pytorch promotion — QA green on 70
+          # cells, every tag pushed — reported as a failed run because a 527-char
+          # header got a 400 from Slack. The clamp fixes that trigger; `-f` is the
+          # class. A 429, a Slack 5xx, or the next payload limit nobody knew about
+          # would each do it again, and "the promotion worked but the run is red"
+          # is the most expensive kind of false alarm: it trains people to ignore
+          # red runs on the pipeline where red matters most.
+          #
+          # Retries first, because a transient really is worth retrying; then warn
+          # rather than exit. The step summary and the run itself remain the record.
+          if ! curl -sS --retry 3 --retry-delay 2 --retry-all-errors \
+                 -X POST "$SLACK_WEBHOOK_URL" \
+                 -H 'Content-type: application/json' \
+                 --data "$PAYLOAD" --fail-with-body; then
+            echo "::warning::Slack notification failed — the build/promotion result above is unaffected"
+          fi

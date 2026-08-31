@@ -1,0 +1,612 @@
+#!/bin/bash
+# Instance test runner — discovers and executes test scripts, writes JSON results.
+#
+# Test discovery order:
+#   1. base/*.sh    — base image tests (always present)
+#   2. *.d/*.sh     — derivative image tests (dropped by derivative images)
+#
+# Each test script must exit: 0 (pass), 1 (fail), 2 (fatal — aborts suite), 77 (skip).
+#
+# Results are written to RESULTS_FILE as JSON, updated after each test.
+# The runner itself exits 0 if all tests pass, 1 if any fail.
+#
+# Usage:
+#   /opt/instance-tools/tests/runner.sh           # automated (from boot script)
+#   /opt/instance-tools/tests/runner.sh --manual   # interactive SSH use
+
+set -euo pipefail
+
+TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+RESULTS_FILE="${INSTANCE_TEST_RESULTS:-/var/log/test-results.json}"
+RESULTS_PORT="${INSTANCE_TEST_PORT:-10199}"
+OUTPUT_LOG="${INSTANCE_TEST_LOG:-/var/log/test-output.log}"
+DEFAULT_TEST_TIMEOUT="${INSTANCE_TEST_DEFAULT_TIMEOUT:-3600}"  # 1 hour; override per-test with # TEST_TIMEOUT=N
+START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+START_EPOCH=$(date +%s)
+
+# ── Manual mode detection ────────────────────────────────────────────
+
+# Auto-detect manual mode: if run from a TTY (interactive shell), default to manual.
+# The boot script backgrounds us (no TTY), so automated mode only activates that way.
+# --manual / --auto flags override the auto-detection.
+if [[ "${1:-}" == "--manual" ]]; then
+    MANUAL=true
+elif [[ "${1:-}" == "--auto" ]]; then
+    MANUAL=false
+elif [[ -t 0 || -t 1 ]]; then
+    # stdin or stdout is a terminal — someone ran this interactively
+    MANUAL=true
+else
+    MANUAL=false
+fi
+
+if [[ "$MANUAL" == "true" ]]; then
+    echo "Running in manual mode (no HTTP server, no webhook, no instance stop)"
+fi
+
+# ── JSON helpers (no jq dependency) ──────────────────────────────────
+
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+write_results() {
+    local state="$1"
+    local now_epoch
+    now_epoch=$(date +%s)
+    local elapsed=$((now_epoch - START_EPOCH))
+
+    local tests_json=""
+    # `local idx`, NOT a bare `i`: this function is called from inside the runner's
+    # own `for i in "${!ALL_TESTS[@]}"` loop, and bash has no function-local scope
+    # unless asked for one. A bare `i` here left the caller's index pointing at the
+    # LAST test, so every per-test state was written to the wrong slot — each test
+    # finished by marking the final entry, and every earlier entry stayed "running"
+    # even on a clean pass.
+    local idx
+    for idx in "${!TEST_NAMES[@]}"; do
+        [[ -n "$tests_json" ]] && tests_json+=","
+        tests_json+=$(printf '{"name":"%s","state":"%s","duration_s":%s}' \
+            "$(_json_escape "${TEST_NAMES[$idx]}")" \
+            "${TEST_STATES[$idx]}" \
+            "${TEST_DURATIONS[$idx]}")
+    done
+
+    local json
+    json=$(printf '{"state":"%s","started_at":"%s","elapsed_s":%d,"tests":[%s]}' \
+        "$state" "$START_TIME" "$elapsed" "$tests_json")
+
+    # Atomic write
+    printf '%s\n' "$json" > "${RESULTS_FILE}.tmp"
+    mv "${RESULTS_FILE}.tmp" "$RESULTS_FILE"
+}
+
+# ── Output logging ───────────────────────────────────────────────────
+# In automated mode, all output goes to both stdout and a log file.
+# The SSE server streams the log file line-by-line to connected clients.
+
+: > "$OUTPUT_LOG"  # truncate
+
+# log_output: write to both stdout and the log file
+log_output() {
+    while IFS= read -r line; do
+        printf '%s\n' "$line"
+        printf '%s\n' "$line" >> "$OUTPUT_LOG"
+    done
+}
+
+# ── Test discovery ───────────────────────────────────────────────────
+
+discover_tests() {
+    local tests=()
+
+    # Base tests (always present)
+    if [[ -d "${TESTS_DIR}/base" ]]; then
+        while IFS= read -r f; do
+            tests+=("$f")
+        done < <(find "${TESTS_DIR}/base" -name '*.sh' -executable | sort)
+    fi
+
+    # Derivative tests (*.d/ directories)
+    while IFS= read -r d; do
+        while IFS= read -r f; do
+            tests+=("$f")
+        done < <(find "$d" -name '*.sh' -executable | sort)
+    done < <(find "${TESTS_DIR}" -maxdepth 1 -name '*.d' -type d | sort)
+
+    printf '%s\n' "${tests[@]}"
+}
+
+# ── Results HTTP server ──────────────────────────────────────────────
+
+RESULTS_SERVER_PID=""
+CLIENT_READY_FILE="/tmp/.test-client-connected"
+
+start_results_server() {
+    # HTTP server with endpoints:
+    #   GET /test-status      — JSON snapshot (for simple polling)
+    #   GET /test-stream      — SSE stream of raw test output lines + final JSON state
+    #   GET /test-stream?log=1 — also interleave system logs (comma-separated in INSTANCE_TEST_SYSTEM_LOG)
+    #   POST /test-start      — Signal that client is connected, tests can begin
+    #
+    # The SSE stream tails the output log, sending each line as it appears.
+    # With ?log=1, it also tails the system log file (ANSI passthrough).
+    # When tests finish, it sends a final "result" event with the JSON summary.
+    rm -f "${CLIENT_READY_FILE}"
+    _RESULTS_FILE="$RESULTS_FILE" \
+    _OUTPUT_LOG="$OUTPUT_LOG" \
+    _SYSTEM_LOGS="${INSTANCE_TEST_SYSTEM_LOG:-}" \
+    _READY_FILE="$CLIENT_READY_FILE" \
+    _AUTH_TOKEN="${OPEN_BUTTON_TOKEN:-}" \
+    _RESULTS_PORT="$RESULTS_PORT" \
+    python3 -c "
+import http.server, json, os, sys, time, threading, io
+from urllib.parse import urlparse, parse_qs
+
+RESULTS = os.environ['_RESULTS_FILE']
+OUTPUT_LOG = os.environ['_OUTPUT_LOG']
+SYSTEM_LOGS = [p.strip() for p in os.environ.get('_SYSTEM_LOGS', '').split(',') if p.strip()]
+READY_FILE = os.environ['_READY_FILE']
+AUTH_TOKEN = os.environ.get('_AUTH_TOKEN', '')
+
+def read_results():
+    try:
+        with open(RESULTS) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return json.dumps({'state': 'pending'})
+
+def signal_client_ready():
+    if not os.path.exists(READY_FILE):
+        open(READY_FILE, 'w').close()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _check_auth(self):
+        if not AUTH_TOKEN:
+            return True
+        auth = self.headers.get('Authorization', '')
+        if auth == f'Bearer {AUTH_TOKEN}':
+            return True
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        if qs.get('token', [''])[0] == AUTH_TOKEN:
+            return True
+        self.send_response(401)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{\"error\":\"unauthorized\"}')
+        return False
+
+    def _strip_token_param(self):
+        '''Return the path with ?token= stripped so it does not interfere with routing.'''
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        qs.pop('token', None)
+        if qs:
+            from urllib.parse import urlencode
+            return f'{parsed.path}?{urlencode(qs, doseq=True)}'
+        return parsed.path
+
+    def do_GET(self):
+        if not self._check_auth():
+            return
+        clean_path = self._strip_token_param()
+        parsed = urlparse(clean_path)
+        if parsed.path == '/test-status':
+            self._serve_json()
+        elif parsed.path == '/test-stream':
+            signal_client_ready()
+            qs = parse_qs(parsed.query)
+            include_log = qs.get('log', ['0'])[0] == '1'
+            self._serve_sse(include_log)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not self._check_auth():
+            return
+        parsed = urlparse(self.path)
+        if parsed.path == '/test-start':
+            signal_client_ready()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(b'{\"ok\":true}')
+        else:
+            self.send_error(404)
+
+    def _serve_json(self):
+        body = read_results()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def _send_sse(self, event, data):
+        self.wfile.write(f'event: {event}\ndata: {data}\n\n'.encode())
+        self.wfile.flush()
+
+    def _serve_sse(self, include_log=False):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('X-Accel-Buffering', 'no')
+        self.end_headers()
+
+        # newline='\\n': disable universal newlines so \\r is NOT
+        # treated as a line ending.  Progress bars use \\r to
+        # overwrite in place — we need it in the line content.
+        output_f = open(OUTPUT_LOG, 'r', newline='\\n')
+        log_files = {}   # path -> file handle
+        log_buffers = {} # path -> partial line buffer
+        last_heartbeat = time.time()
+        HEARTBEAT_INTERVAL = 5  # seconds between keep-alive comments
+
+        def _resolve_cr(raw):
+            '''Strip line endings, resolve mid-line \\r to last segment.
+            Returns (clean_line, had_cr).'''
+            s = raw.rstrip('\\r\\n')
+            if '\\r' in s:
+                return s.rsplit('\\r', 1)[-1], True
+            return s, False
+
+        try:
+            while True:
+                had_data = False
+
+                # Read test output lines (complete lines only — log_output
+                # writes with printf '%s\\n' so readline always gets \\n)
+                line = output_f.readline()
+                if line:
+                    had_data = True
+                    clean, _ = _resolve_cr(line)
+                    self._send_sse('output', json.dumps(clean))
+
+                # Read system log lines (multiple files supported).
+                # Tailed live — readline() may return partial lines (no
+                # trailing \\n).  We buffer per-file and emit two ways:
+                #   - Complete line (has \\n): emit normally, clear buffer.
+                #     If line had \\r, resolve to last segment + overwrite flag.
+                #   - Partial line (no \\n): emit as overwrite preview so the
+                #     client shows live updates (progress bars, status lines).
+                #     The next chunk extends the buffer until \\n commits it.
+                if include_log:
+                    for log_path in SYSTEM_LOGS:
+                        if log_path not in log_files:
+                            if os.path.exists(log_path):
+                                f = open(log_path, 'r', newline='\\n')
+                                log_files[log_path] = f
+                                log_buffers[log_path] = ''
+                        if log_path in log_files:
+                            chunk = log_files[log_path].readline()
+                            if chunk:
+                                had_data = True
+                                log_buffers[log_path] += chunk
+                                buf = log_buffers[log_path]
+                                src = os.path.basename(log_path)
+                                if buf.endswith('\\n'):
+                                    # Complete line — commit and clear buffer
+                                    log_buffers[log_path] = ''
+                                    log_clean, had_cr = _resolve_cr(buf)
+                                    msg = {'src': src, 'line': log_clean}
+                                    if had_cr:
+                                        msg['overwrite'] = True
+                                    self._send_sse('log', json.dumps(msg))
+                                else:
+                                    # Partial line — send live preview as overwrite
+                                    log_clean, _ = _resolve_cr(buf)
+                                    msg = {'src': src, 'line': log_clean, 'overwrite': True}
+                                    self._send_sse('log', json.dumps(msg))
+
+                if not had_data:
+                    # Check if tests finished
+                    results = read_results()
+                    try:
+                        state = json.loads(results).get('state')
+                        if state in ('passed', 'failed'):
+                            self._send_sse('result', results)
+                            break
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+                    # Send SSE heartbeat comment to keep connection alive.
+                    # Tests like vLLM health can poll silently for minutes.
+                    now = time.time()
+                    if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                        self.wfile.write(b': heartbeat\n\n')
+                        self.wfile.flush()
+                        last_heartbeat = now
+                    time.sleep(0.1)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            output_f.close()
+            for f in log_files.values():
+                f.close()
+
+    def log_message(self, *a):
+        pass
+
+_port_str = os.environ.get('_RESULTS_PORT', '10199')
+port = int(_port_str) if _port_str.isdigit() else 10199
+# ThreadingHTTPServer so /test-status can be served while /test-stream
+# is active (SSE blocks the handler thread for the stream's lifetime).
+if hasattr(http.server, 'ThreadingHTTPServer'):
+    server = http.server.ThreadingHTTPServer(('0.0.0.0', port), Handler)
+else:
+    # Python 3.6 fallback
+    import socketserver
+    class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+    server = ThreadedServer(('0.0.0.0', port), Handler)
+server.daemon_threads = True
+server.serve_forever()
+" &
+    RESULTS_SERVER_PID=$!
+    echo "Results server started on port ${RESULTS_PORT} (pid ${RESULTS_SERVER_PID})"
+}
+
+wait_for_client() {
+    # Wait up to 2 hours for a client to connect before starting tests.
+    # This prevents tests from running and completing before anyone is watching.
+    local timeout=7200
+    local elapsed=0
+    echo "Waiting for test client to connect..."
+    while [[ ! -f "${CLIENT_READY_FILE}" ]] && (( elapsed < timeout )); do
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if [[ -f "${CLIENT_READY_FILE}" ]]; then
+        echo "Client connected, starting tests"
+    else
+        echo "No client connected after ${timeout}s, starting tests anyway"
+    fi
+}
+
+stop_results_server() {
+    if [[ -n "${RESULTS_SERVER_PID:-}" ]]; then
+        kill "$RESULTS_SERVER_PID" 2>/dev/null || true
+        wait "$RESULTS_SERVER_PID" 2>/dev/null || true
+    fi
+}
+trap stop_results_server EXIT
+
+# ── Post-test actions (automated mode only) ──────────────────────────
+
+post_test_webhook() {
+    if [[ -n "${INSTANCE_TEST_WEBHOOK:-}" ]]; then
+        curl -sf -X POST -H "Content-Type: application/json" \
+            -d @"${RESULTS_FILE}" "${INSTANCE_TEST_WEBHOOK}" \
+            --max-time 10 || echo "Webhook POST failed (non-fatal)"
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+base_failed=false
+declare -a TEST_NAMES=()
+declare -a TEST_STATES=()
+declare -a TEST_DURATIONS=()
+
+# Start HTTP results server (automated mode only)
+if [[ "$MANUAL" == "false" ]]; then
+    start_results_server
+fi
+
+# In automated mode, wait for a client to connect before running tests.
+# This ensures the SSE stream is established and no results are missed.
+if [[ "$MANUAL" == "false" ]]; then
+    wait_for_client
+
+    # OPEN_BUTTON_TOKEN is required in automated mode — without a real token
+    # the results server is unauthenticated on a public port.
+    # "1" is a Vast placeholder meaning "enabled", not a valid secret.
+    # Check after client connects so the failure is visible via SSE.
+    _obt="${OPEN_BUTTON_TOKEN:-}"
+    if [[ -z "$_obt" || "$_obt" == "1" ]]; then
+        echo "FATAL: OPEN_BUTTON_TOKEN is not set or invalid (got '${_obt:-}')." | log_output
+        echo "  The template must provide a real token for results server auth." | log_output
+        write_results "failed"
+        sleep 5  # give SSE client time to receive the failure
+        exit 1
+    fi
+fi
+
+# No blind provisioning wait — test 12-provisioning.sh handles monitoring.
+# Tests before 12 run immediately; tests after 12 run once provisioning is confirmed.
+
+# Discover tests
+mapfile -t ALL_TESTS < <(discover_tests)
+
+if [[ ${#ALL_TESTS[@]} -eq 0 ]]; then
+    echo "No tests found in ${TESTS_DIR}"
+    write_results "passed"
+    exit 0
+fi
+
+echo "Discovered ${#ALL_TESTS[@]} tests" | log_output
+
+# Initialize all tests as pending
+for test_path in "${ALL_TESTS[@]}"; do
+    local_name="${test_path#"${TESTS_DIR}/"}"
+    local_name="${local_name%.sh}"
+    TEST_NAMES+=("$local_name")
+    TEST_STATES+=("pending")
+    TEST_DURATIONS+=("0")
+done
+
+write_results "running"
+
+# Run tests
+has_failure=false
+for i in "${!ALL_TESTS[@]}"; do
+    test_path="${ALL_TESTS[$i]}"
+    test_name="${TEST_NAMES[$i]}"
+
+    # ── Phase gate: do not start the expensive tail on a sick platform ──
+    #
+    # base/ is the platform contract and is cheap — the whole phase is ~60s.
+    # The derivative *.d/ suites are the expensive part: model downloads and
+    # inference, tens of minutes on an image like comfyui or vllm.
+    #
+    # If base failed, this cell is already lost. ADR 0029 redraws on ANY
+    # failure, so nothing downstream can change the verdict — it can only spend
+    # a rented GPU for tens of minutes to reach a conclusion already reached,
+    # and then be discarded. Worse, every derivative assertion after a broken
+    # base is measuring a degraded platform, so a PASS there is not evidence
+    # either.
+    #
+    # The cut is at the PHASE boundary, deliberately, not at the failing test.
+    # Aborting on the first red would have destroyed the evidence that produced
+    # ADR 0029's amendment: 10-supervisor, 20-portal and 26-caddy-auth failing
+    # TOGETHER is what identified the shared root cause, and 67-service-
+    # functionality passing on the same endpoints 53s later is what proved the
+    # host innocent. Cheap diagnostics are worth finishing; the expensive tail
+    # is not. Same reasoning as 12-provisioning's existing test_fatal.
+    if [[ "$test_name" != base/* && "$base_failed" == "true" ]]; then
+        for ((j=i; j<${#ALL_TESTS[@]}; j++)); do
+            TEST_STATES[$j]="skipped"
+        done
+        echo "" | log_output
+        echo "─── DERIVATIVE PHASE NOT ATTEMPTED ───" | log_output
+        echo "  A base/ test failed, so the ${test_name%%/*} suite was not run." | log_output
+        echo "  These tests are NOT passing and NOT skipped-by-design — they were" | log_output
+        echo "  never started. The cell fails on the base failure above and is" | log_output
+        echo "  redrawn (ADR 0029) without spending the derivative phase." | log_output
+        write_results "running"
+        break
+    fi
+
+    echo "─── Running: ${test_name} ───" | log_output
+    TEST_STATES[$i]="running"
+    write_results "running"
+
+    test_start=$(date +%s)
+    # Per-test timeout: check for TEST_TIMEOUT in script header, fall back to DEFAULT_TEST_TIMEOUT.
+    test_timeout=$(grep -oP '^# TEST_TIMEOUT=\K\d+' "$test_path" 2>/dev/null || echo "$DEFAULT_TEST_TIMEOUT")
+    set +e
+    # Run test with clean shell options — don't leak errexit/nounset via SHELLOPTS.
+    TEST_NAME="$test_name" timeout "$test_timeout" env -u SHELLOPTS bash "$test_path" 2>&1 | log_output
+    rc=${PIPESTATUS[0]}
+    set -e
+    test_end=$(date +%s)
+    TEST_DURATIONS[$i]=$((test_end - test_start))
+
+    case $rc in
+        0)
+            TEST_STATES[$i]="passed"
+            echo "  → PASSED (${TEST_DURATIONS[$i]}s)" | log_output
+            ;;
+        2)
+            # Fatal: test signalled the suite should abort (e.g. provisioning failed)
+            TEST_STATES[$i]="failed"
+            has_failure=true
+            [[ "$test_name" == base/* ]] && base_failed=true
+            echo "  → FAILED [FATAL] (${TEST_DURATIONS[$i]}s)" | log_output
+            # Mark remaining tests as skipped
+            for ((j=i+1; j<${#ALL_TESTS[@]}; j++)); do
+                TEST_STATES[$j]="skipped"
+            done
+            echo "  aborting suite — fatal failure in ${test_name}" | log_output
+            write_results "running"
+            break
+            ;;
+        77)
+            TEST_STATES[$i]="skipped"
+            echo "  → SKIPPED (${TEST_DURATIONS[$i]}s)" | log_output
+            ;;
+        124)
+            TEST_STATES[$i]="failed"
+            has_failure=true
+            [[ "$test_name" == base/* ]] && base_failed=true
+            echo "  → FAILED (timeout after ${test_timeout}s)" | log_output
+            ;;
+        *)
+            TEST_STATES[$i]="failed"
+            has_failure=true
+            [[ "$test_name" == base/* ]] && base_failed=true
+            echo "  → FAILED (exit code ${rc}, ${TEST_DURATIONS[$i]}s)" | log_output
+            ;;
+    esac
+
+    write_results "running"
+done
+
+# Required-pass gate (ADR 0019). A QA template names the tests that MUST have
+# PASSED — not skipped, not missing from the image, not left unreached by an
+# earlier fatal. Without this, a test that self-skips is indistinguishable from
+# one that ran clean: the GPU suite skips itself on a box where nvidia-smi or
+# libcuda is unavailable, and the runner reports the whole suite green, so a QA
+# gate could certify an image whose CUDA userland never loaded.
+#
+# Opt-in by design: unset (every customer instance, and any image not being
+# gated on it) keeps the existing skip-is-fine behaviour.
+if [[ -n "${INSTANCE_TEST_REQUIRE_PASS:-}" ]]; then
+    echo "─── Required-pass gate: ${INSTANCE_TEST_REQUIRE_PASS} ───" | log_output
+    # Accept comma- and/or whitespace-separated names.
+    # read -ra, not an unquoted expansion: word-splitting is wanted, pathname
+    # expansion is not. An unquoted $_required_raw containing a `*` would glob
+    # against the CWD and silently rewrite the required list.
+    read -ra _required_names <<< "${INSTANCE_TEST_REQUIRE_PASS//,/ }"
+    for _req in "${_required_names[@]}"; do
+        [[ -z "$_req" ]] && continue
+        _found=false
+        _state=""
+        # `_idx`, not `i` — the runner's test loop owns `i` at top level (see the
+        # note in write_results); reusing it here would work only by accident of
+        # this block running last.
+        for _idx in "${!TEST_NAMES[@]}"; do
+            if [[ "${TEST_NAMES[$_idx]}" == "$_req" ]]; then
+                _found=true
+                _state="${TEST_STATES[$_idx]}"
+                break
+            fi
+        done
+        # NOTE: deliberately not prefixed with the "→" verdict marker. The client
+        # (test_template.py) attributes any line starting with → to the test named
+        # by the preceding "─── Running: ─── " header, and by this point that is
+        # cleared — such a line would bump the failed counter while attaching to no
+        # test. The gate's effect reaches the client through has_failure, which
+        # makes the final result event "failed"; that is the authoritative path.
+        if ! $_found; then
+            has_failure=true
+            echo "  REQUIRED-FAIL ${_req}: missing from this image" | log_output
+        elif [[ "$_state" != "passed" ]]; then
+            has_failure=true
+            echo "  REQUIRED-FAIL ${_req}: did not pass (state=${_state})" | log_output
+        else
+            echo "  ok: ${_req}" | log_output
+        fi
+    done
+fi
+
+# Final state
+if $has_failure; then
+    write_results "failed"
+    echo "══════════════════════════════" | log_output
+    echo "  TEST SUITE FAILED" | log_output
+    echo "══════════════════════════════" | log_output
+else
+    write_results "passed"
+    echo "══════════════════════════════" | log_output
+    echo "  ALL TESTS PASSED" | log_output
+    echo "══════════════════════════════" | log_output
+fi
+
+# Post-test actions (automated mode only)
+if [[ "$MANUAL" == "false" ]]; then
+    post_test_webhook
+    # Keep HTTP server alive so clients can poll /test-status for final results.
+    # The SSE result event may race with our exit; this ensures it's fetchable.
+    sleep 30
+fi
+
+$has_failure && exit 1 || exit 0

@@ -1,0 +1,27 @@
+# Third-Party Licenses
+
+This image bundles the following vendor application(s). Each is the property of
+its respective authors and is distributed under the license shown below. Where
+the vendor's source or LICENSE file is shipped inside this image at a known
+location, the path is given. Otherwise, the upstream repository is referenced
+as the canonical source for the license text.
+
+## PyTorch
+
+- **License:** BSD-3-Clause
+- **Upstream:** https://github.com/pytorch/pytorch
+- **License file in image:** Included in the pip-installed package under
+  `/venv/main/lib/python3.*/site-packages/torch-*.dist-info/LICENSE`
+
+## Stable Diffusion WebUI Forge
+
+- **License:** AGPL-3.0
+- **Upstream:** https://github.com/lllyasviel/stable-diffusion-webui-forge
+- **License file in image:** `/opt/workspace-internal/stable-diffusion-webui-forge/LICENSE.txt`
+- **Modifications:** This image (AGPL §5a) comments out `launch_utils.verify_version()`
+  in `launch.py` (bypassed for the Docker build) and strips the torch pins from the
+  Forge requirements so the app inherits the base image's torch build. Complete
+  corresponding source, including these changes, is public at
+  https://github.com/vast-ai/base-image (see the image's Dockerfile).
+- **Notes:** This image supports multiple Forge variants. The upstream URL and
+  license may differ depending on the `FORGE_REPO` build argument used.

@@ -1,0 +1,95 @@
+# ComfyUI QA template (ADR 0005 live-GPU QA gate).
+#
+# Mirrors the PRODUCTION ComfyUI template (vast_landing .../recommended_templates/
+# 160-comfyui) so QA exercises the real launch path — `runtype: jupyter` (Jupyter
+# injected by Vast at runtime, not the entrypoint/args mode), the full PORTAL_CONFIG,
+# the production COMFYUI_ARGS, and the api-wrapper backend. QA-only deltas: private/
+# disposable, an SD1.5 smoke workflow (vs prod's SDXL-Turbo), and the ADR 0005
+# selection floors (amd64 is forced by the tool, not the template).
+#
+# CI overrides `tag` (and `image`) with the freshly-built staging tag via
+# `create.py --tag`, and PROVISIONING_COMFYUI_WORKFLOWS via `test_template.py --env`
+# pinned to the dispatched SHA (the `main` default below is for manual runs).
+name: "ComfyUI QA — SD1.5 smoke"
+image: vastai/comfyui
+tag: latest                       # CI overrides with the staging tag
+private: true                     # disposable QA template, never public
+readme_visible: false
+onstart: entrypoint.sh
+runtype: jupyter                  # production launch mode (was 'args' = entrypoint mode)
+jup_direct: true
+ssh_direct: true
+use_ssh: true
+use_jupyter_lab: false
+ports:
+  - "1111:1111"                   # Instance Portal
+  - "8080:8080"                   # Jupyter
+  - "8188:8188"                   # ComfyUI
+  - "8288:8288"                   # API Wrapper
+  - "8384:8384"                   # Syncthing
+  # The serverless worker's port, MANDATORY for the serverless cells rather than
+  # decorative. The platform injects VAST_TCP_PORT_<n> only for ports a template MAPS,
+  # and the pyworker SDK looks up exactly that with no guard —
+  #     worker_port = os.environ[f"VAST_TCP_PORT_{os.environ['WORKER_PORT']}"]
+  # (vastai/serverless/server/lib/metrics.py) — so an unmapped 3000 is a KeyError inside
+  # Metrics() during Backend construction, before the worker binds anything or runs a
+  # benchmark. Measured live on the first serverless cell ever run, on vLLM. Gated by
+  # L073. Harmless on the standard cell: nothing binds 3000 there, and base/28 scans
+  # LISTENERS rather than mappings, so an unused mapping is not an exposure.
+  - "3000:3000"                   # serverless worker (pyworker)
+env:
+  COMFYUI_ARGS: "--disable-auto-launch --disable-xformers --port 18188 --enable-cors-header"
+  # api-wrapper /health probes the backend's /system_stats + WebSocket; point it at
+  # ComfyUI DIRECTLY (18188), not the Caddy edge (8188) which OPEN_BUTTON_TOKEN auth-gates.
+  COMFYUI_API_BASE: "http://localhost:18188"
+  PORTAL_CONFIG: "localhost:1111:11111:/:Instance Portal|localhost:8188:18188:/:ComfyUI|localhost:8288:18288:/docs:API Wrapper|localhost:8080:18080:/:Jupyter|localhost:8080:8080:/terminals/1:Jupyter Terminal|localhost:8384:18384:/:Syncthing"
+  OPEN_BUTTON_PORT: "1111"
+  OPEN_BUTTON_TOKEN: "1"
+  JUPYTER_DIR: "/"
+  DATA_DIRECTORY: "/workspace/"
+  # Required-pass gate (ADR 0019, widened to this template by ADR 0031). The GPU
+  # trio self-skips when nvidia-smi or libcuda never came up, and
+  # `comfyui.d/10-comfyui-serving` self-skips three ways — no GPU, no payloads
+  # directory, no API-format workflows in it. The last two are the ones that bite
+  # here: this gate's whole subject is the workflow POSTed through the API wrapper,
+  # and if provisioning silently fetched nothing, the test skips and the suite
+  # reports green over an image that generated no image. Enforced twice — by the
+  # runner in-instance and by qa_verdict.py in CI, via the matching `require_tests`
+  # in build-comfyui.yml. Gated by linter rules L057 and L072.
+  INSTANCE_TEST_REQUIRE_PASS: "base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries comfyui.d/10-comfyui-serving"
+  PROVISIONING_COMFYUI_WORKFLOWS: "https://raw.githubusercontent.com/vast-ai/base-image/main/derivatives/pytorch/derivatives/comfyui/templates/comfyui-qa/sd15-txt2img.json"
+# QA gate floors (ADR 0005): smallest viable box at/above these, VRAM bounded 3x.
+extra_filters:
+  compute_cap:
+    gte: 750                      # sm_75 — matches the production template
+  cuda_max_good:
+    gte: 13.2                     # host driver must satisfy the newer matrix variant (cuda-13.2)
+  gpu_total_ram:
+    gte: 8192                     # 8 GB floor (SD1.5 + headroom); selection bounds to [8,24] GB
+  # Bandwidth floor. The cell pulls a multi-GB image before a single test can run,
+  # and that pull sits inside the launch window the client bounds with poll_timeout —
+  # so a slow link does not merely make the run late, it can burn the whole attempt
+  # and force a redraw (ADR 0029) on a host that had nothing wrong with the image.
+  #
+  # Measured against the live pool matching these same floors: median ~900 Mbps, but
+  # the bottom decile advertises 326-524 and the slowest offer 34 Mbps. At 34 Mbps a
+  # ~25 GB image is over an hour of pull before the suite starts; 500 bounds it to
+  # single-digit minutes and still keeps 65-88% of the pool depending on the template.
+  #
+  # This is COMPLEMENTARY to direct_port_count, not a replacement — the two exclude
+  # different failures, and neither subsumes the other. Advertised bandwidth is a
+  # claim, so this floor cannot catch a host that overstates its link; the port floor
+  # is what covers that. What this floor catches is the host that is honestly slow,
+  # which the port floor does not look at.
+  #
+  # DIRECTION: a LOWER bound. Tunable: raise toward 1000 if pulls still drag, at the
+  # cost of roughly two thirds of the offer pool.
+  inet_down:
+    gte: 500                      # Mbps
+  # Host-networking floor, matching base-qa and pytorch-qa. See the longer note in
+  # templates/base-qa/template.yml for the measurement behind the value.
+  #
+  # DIRECTION: a LOWER bound. An `lte` here would select FOR the hosts it excludes.
+  direct_port_count:
+    gte: 64
+recommended_disk_space: 40.0      # ComfyUI image + 2.1 GB SD1.5 checkpoint + workspace

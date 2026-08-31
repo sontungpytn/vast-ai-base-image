@@ -1,0 +1,305 @@
+# Instance Test Framework
+
+Automated test suite that validates a Vast.ai instance is correctly configured after boot and provisioning. Tests cover the base image infrastructure; derivative images can add their own tests.
+
+## Architecture
+
+```
+tests/
+├── runner.sh              # Test runner — discovery, execution, results, post-test actions
+├── lib.sh                 # Shared helpers — sourced by every test script
+├── base/                  # Base image tests (always present)
+│   ├── 10-supervisor.sh
+│   ├── 11-instance-metadata.sh
+│   ├── 12-provisioning.sh
+│   ├── ...
+│   ├── 85-serverless-services.sh
+│   └── 86-serverless-pyworker.sh
+└── *.d/                   # Derivative test directories (e.g. pytorch.d/, comfyui.d/)
+```
+
+### Runner (`runner.sh`)
+
+Discovers and executes test scripts in sort order. Writes JSON results to `/var/log/test-results.json` after each test, enabling real-time monitoring.
+
+**Modes:**
+- **Automated** — launched by boot script (`/etc/vast_boot.d/70-instance-test.sh`) when `INSTANCE_TEST=true`. Runs *before* provisioning, so the runner's HTTP/SSE results server (port 10199) is up within seconds of boot and a client can connect and watch provisioning live. Waits for a client to connect, posts results to an optional webhook on completion. The test *client* (`run_test.py`) handles instance stop/destroy.
+- **Manual** — auto-detected when run from a TTY (interactive shell). No HTTP server, no webhook, no instance stop. Can also be forced with `--manual` / `--auto` flags.
+
+**Per-test timeout:** Each test gets 3600s (1 hour) by default, configurable via `INSTANCE_TEST_DEFAULT_TIMEOUT`. Override per-test with a `# TEST_TIMEOUT=N` comment in the script header (see `12-provisioning.sh`).
+
+**Results JSON format:**
+```json
+{
+  "state": "running|passed|failed",
+  "started_at": "2026-03-12T10:00:00Z",
+  "elapsed_s": 42,
+  "tests": [
+    {"name": "base/10-supervisor", "state": "passed|failed|skipped|running|pending", "duration_s": 1}
+  ]
+}
+```
+
+**Results endpoints (automated mode):**
+- `GET :10199/test-status` — JSON snapshot of current results
+- `GET :10199/test-stream` — SSE stream of test output lines
+- `GET :10199/test-stream?log=1` — SSE stream with system log lines interleaved
+- `POST :10199/test-start` — Signal client connected (triggers test start)
+
+SSE events: `output` (test lines), `log` (system log lines with `src` and optional `overwrite` for progress bars), `result` (final JSON). Heartbeat comments (`: heartbeat`) sent every 5s to keep connections alive.
+
+### Library (`lib.sh`)
+
+Sourced by every test. Provides:
+
+| Function | Type | Description |
+|----------|------|-------------|
+| `test_pass "msg"` | Exit | Report success, exit 0 |
+| `test_fail "msg"` | Exit | Report failure, exit 1 |
+| `test_fatal "msg"` | Exit | Report failure and abort suite, exit 2 |
+| `test_skip "msg"` | Exit | Report skip, exit 77 |
+| `fail_later "label" "msg"` | Deferred | Record failure without exiting |
+| `report_failures` | Deferred | Exit with failure if any `fail_later` calls were made |
+| `has_gpu` | Predicate | `nvidia-smi` succeeds |
+| `is_serverless` | Predicate | `$SERVERLESS` is "true" |
+| `is_vast_image` | Predicate | `$IMAGE_TYPE` is "vast" |
+| `portal_has_entry "term"` | Predicate | grep for term in `/etc/portal.yaml` |
+| `version_gt A B` | Predicate | Dotted version comparison (e.g. `12.10` > `12.9`) |
+| `instance_field "key"` | Query | Read field from cached API metadata JSON |
+| `wait_for_supervisor [timeout]` | Wait | Poll until supervisord's RPC socket answers (default 60s; memoised per test process) |
+| `wait_for_url URL [timeout]` | Wait | Poll for HTTP 200 |
+| `wait_for_port PORT [timeout]` | Wait | Poll for TCP listener |
+| `wait_for_caddy [port] [proto] [timeout]` | Wait | Poll for Caddy (accepts 401 as responsive); default `CADDY_READY_TIMEOUT` (120s) — a restart runs `caddy hash-password` per app first |
+| `assert_file_exists PATH` | Assert | |
+| `assert_dir_exists PATH` | Assert | |
+| `assert_file_mode PATH OCTAL` | Assert | `stat -c '%a'` comparison (use `440` not `0440`) |
+| `assert_command_exists CMD` | Assert | |
+| `assert_service_running NAME [timeout]` | Assert | Wait for RUNNING (default 60s); short-circuits on FATAL |
+| `assert_service_stopped NAME` | Assert | supervisorctl STOPPED/EXITED/FATAL |
+| `assert_env_set VARNAME` | Assert | Non-empty env var |
+| `assert_user_exists USER [UID]` | Assert | `id -u` check |
+| `service_running NAME` | Predicate | RUNNING check (return 0/1); waits for the socket, not for RUNNING |
+| `find_caddy_ports` | Query | Populate REPLY with active Caddy external ports |
+| `caddy_port_proto PORT` | Query | Echo "https" or "http" for a Caddyfile port |
+| `http_check LABEL EXPECTED [curl_args...]` | Assert | HTTP status check via `fail_later` (pipe-delimited codes ok). `--max-time 20` — Caddy pays a cost-14 bcrypt on every distinct wrong credential; pass a later `--max-time` to override |
+
+**Budgets are levers (L070).** `SUPERVISOR_READY_TIMEOUT`, `PORTAL_READY_TIMEOUT`,
+`CADDY_READY_TIMEOUT` and `HTTP_CHECK_MAX_TIME` are env-overridable — the suite
+ships inside the image, so a baked number can only be fixed by rebuilding every
+image. Their defaults are floor-pinned by L070 against measurements in
+docs/invariants.md; raise them freely, never lower them past what was measured.
+
+**Readiness, not presence (L069).** The suite starts while supervisord is still
+starting — `65-supervisor-launch.sh` backgrounds it and boot moves straight on to
+`70-instance-test.sh`. `pgrep`/`pidof` are satisfied at fork; the RPC socket
+appears later (measured 1.7 ms vs 383 ms, idle), and the long-running `conf.d`
+programs are `STARTING` for their first five seconds (`startsecs=5`; `cron` and
+`pyworker` are `startsecs=0`). Never gate readiness on
+process presence — use `wait_for_supervisor` or `assert_service_running`.
+Presence is still the right tool for IDENTITY (which pid is caddy) and for
+asserting a service is ABSENT. See docs/invariants.md and ADR 0029.
+
+**Instance metadata:** Test 11 queries the Vast API and caches the full instance JSON at `/tmp/instance-test-metadata.json`. Use `instance_field "gpu_name"` etc. from any test that runs after 11.
+
+## Test ordering
+
+Tests execute in filename sort order. The numbering creates two phases:
+
+| Range | Phase | Description |
+|-------|-------|-------------|
+| 10–11 | Pre-provisioning | Supervisor alive, instance identity/API, basic infrastructure |
+| 12 | **Provisioning gate** | Monitors provisioning for activity; blocks until done or hung |
+| 15–60 | Post-provisioning | Boot markers, portal, caddy, networking, filesystem, users, python, binaries, env, GPU/CUDA |
+| 65–86 | Service validation | Supervisor service states, functional HTTP checks, logging, cron, serverless services, serverless pyworker |
+
+**Why ordering matters:** Provisioning (step 12) can register new supervisor services, install packages, and download models. Tests that check service states or installed software must run after it.
+
+## Writing a new test
+
+### Template
+
+```bash
+#!/bin/bash
+# Test: brief description of what this validates.
+source "$(dirname "$0")/../lib.sh"
+
+# Skip entire test if precondition not met
+has_gpu || test_skip "no GPU detected"
+
+# Do checks...
+assert_command_exists something
+some_output=$(some_command 2>&1) || test_fail "some_command failed"
+
+# Informational output (shown in runner log, not in JSON)
+echo "  detail: ${some_output}"
+
+# End with exactly one test_pass
+test_pass "description of what passed"
+```
+
+### Key rules
+
+1. **Source `lib.sh`** — always the first non-comment line.
+
+2. **Exit codes** — `test_pass` (0), `test_fail` (1), `test_fatal` (2, aborts entire suite), `test_skip` (77). The runner interprets these. Never `exit` directly.
+
+3. **Skip, don't fail on absent features** — if a feature may not exist on all images (e.g. `/venv/main`, `/opt/nvm`, specific binaries), check for its presence and skip that check gracefully. Only fail if something that *should* be there is broken.
+
+4. **One `test_pass` at the end** — a test must reach exactly one `test_pass` call. If you need to check multiple things that can each fail independently, use the `fail_later` pattern (see `65-conditional-services.sh`) to collect failures and report them all at the end.
+
+5. **Use `echo "  ..."` for details** — indented with two spaces. These appear in the runner's stdout log. Keep them concise.
+
+6. **No `local` at top level** — test scripts run at the top level (not inside a function), so `local` is invalid. Use it inside functions you define within the test.
+
+7. **Custom timeout** — for long-running tests, add `# TEST_TIMEOUT=N` as a comment near the top of the script. The runner scans the entire file with `grep ^# TEST_TIMEOUT=` so it can appear on any line (convention: in the header block, after the shebang and description).
+
+8. **Boot scripts are sourced** — if adding a boot script to `/etc/vast_boot.d/`, never use `exit` (it kills the boot sequence). Use `return` instead.
+
+### Derivative tests
+
+Derivative images (pytorch, comfyui, etc.) add tests by creating a directory named `<derivative>.d/` alongside `base/`:
+
+```
+tests/
+├── base/           # Base image tests
+├── pytorch.d/      # Added by pytorch derivative
+│   ├── 10-torch.sh
+│   └── 20-cuda-runtime.sh
+└── comfyui.d/      # Added by comfyui derivative
+    └── 10-comfyui.sh
+```
+
+The runner discovers `*.d/` directories automatically. Tests within each directory are sorted and run after all `base/` tests. Derivative tests have access to everything in `lib.sh` including `instance_field`.
+
+## Exposure allowlist (`exposure-allowlist/`)
+
+`base/28-inadvertent-exposure.sh` is a **fail-closed** security scan (ADR 0006): every
+public (`0.0.0.0`/`::`/`*`) TCP listener must be either Caddy (the HTTP auth gate) or
+explicitly declared in `exposure-allowlist/`, or it is flagged as an inadvertent
+exposure. Raw UDP and unattributable (no-owning-process / platform) listeners are
+WARNed, not failed. It is **advisory** (reports but passes) until promoted via
+`EXPOSURE_ENFORCE=true`.
+
+The allowlist is **layered**, like `vast_boot.d`/`conf.d`: base ships the platform floor
+(`00-base.conf` — sshd, Vast-injected Jupyter, the test harness, syncthing); a
+**derivative or external image declares its own legitimately-public non-Caddy ports** by
+dropping a fragment in its `ROOT/` overlay:
+
+```
+# ROOT/opt/instance-tools/tests/exposure-allowlist/50-linux-desktop.conf
+# <port|env:VAR>/proto   class   note
+5900/tcp                 raw     VNC (no global auth gate; template/operator's responsibility)
+```
+
+`class` ∈ `raw` | `self-auth-http` | `harness` | `platform`. Only declare a port you
+intend to be publicly reachable without Caddy in front; if it speaks HTTP, prefer putting
+it behind Caddy instead (bind the backend to `127.0.0.1`).
+
+**Ports Vast assigns at runtime** — where the container port is fixed but the public one
+is per-instance — are declared as `env:VAR/proto`, resolved from the environment at scan
+time. The base floor uses this for syncthing's sync listener
+(`env:VAST_TCP_PORT_72299/tcp`), which binds `0.0.0.0` on a Vast-assigned port that no
+literal key could match. An unset or non-numeric variable allowlists nothing, so the
+fail-closed direction is preserved.
+
+The scan **requires root** (`ss -p` cannot attribute other users' sockets); a non-root
+run — e.g. `runner.sh --manual` over SSH as a normal user — skips rather than reporting a
+pass it did not actually decide.
+
+### Caddy-fronted ports are NOT (and must not be) in the allowlist
+
+A port served by Caddy — Instance Portal `1111`, Tensorboard `6006`, the WebUI/API
+fronts, etc. — is intentionally **absent** from the allowlist, and every
+PORTAL_CONFIG-proxied front is handled automatically. The proxied backends bind
+`127.0.0.1`, so they are not public at all.
+
+**Corrected (ADR 0028 binding condition 5).** This section used to say the mechanism
+was "is the listener `caddy`" — that the test reasons from the live owning process.
+That is being replaced, because identity was never the right question: it proved
+caddy owned the socket, never that the front actually *gates*. It also carried a
+latent trap, since caddy is attributable today only because it runs as root, so an
+identity-based pass would flip every front to violation the day caddy is dropped to
+an unprivileged uid. The ADR 0028 scanner passes a port as a Caddy front iff it is a
+Caddyfile site address **and** an unauthenticated request is challenged with 401/403
+— behaviour, not identity. It runs in shadow mode until it takes over the verdict.
+
+**Do not "fix" a missing front port by allowlisting it.** The allowlist passes a port
+*regardless of what is listening on it*, so allowlisting e.g. `6006` would let an app
+that binds Tensorboard directly on `0.0.0.0:6006` (bypassing Caddy, no auth) pass — which
+is exactly the unauthenticated exposure this gate exists to catch. The check's whole value
+is confirming that **Caddy**, not the raw app, owns those HTTP ports; if a Caddy-fronted
+service is instead bound directly and publicly, the gate correctly flags it as a violation.
+The allowlist is only for ports that *legitimately bypass* Caddy (raw TCP/UDP, and
+self-auth HTTP that Vast injects and the image cannot move behind Caddy, e.g. Jupyter).
+
+## Environment variables
+
+### Runner configuration
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INSTANCE_TEST` | — | Set to "true" to launch runner from boot script |
+| `INSTANCE_TEST_RESULTS` | `/var/log/test-results.json` | Results file path |
+| `INSTANCE_TEST_LOG` | `/var/log/test-output.log` | Test output log path |
+| `INSTANCE_TEST_PORT` | `10199` | HTTP results server port |
+| `INSTANCE_TEST_DEFAULT_TIMEOUT` | `3600` | Per-test timeout in seconds (overridable per-test via `# TEST_TIMEOUT=N`) |
+| `INSTANCE_TEST_SYSTEM_LOG` | — | Comma-separated log file paths to stream to client (e.g. `/var/log/portal/vllm.log`) |
+| `INSTANCE_TEST_WEBHOOK` | — | URL to POST results JSON to on completion |
+| `INSTANCE_TEST_REQUIRE_PASS` | — | Space/comma-separated test names that MUST have **passed** for the suite to pass. A named test that skipped, is missing from the image, or was never reached fails the run (ADR 0019). Unset = a skip is fine, which is right for customer instances and wrong for a gating QA run. |
+| `EXPOSURE_ENFORCE` | `false` | `true` makes `base/28-inadvertent-exposure.sh` FAIL on a violation instead of reporting it advisory (ADR 0006 cond 2). A scan that could not run fails either way. |
+
+### Required-pass gate
+
+A skip is not a pass. `test_skip` exits 77, the runner records `skipped`, and a skip
+does not fail the suite — so the GPU trio (`60-gpu-cuda`, `61-cuda-compute`,
+`62-gpu-libraries`), which all open with `has_gpu || test_skip`, reports green on a box
+whose driver or CUDA userland never came up. That is fine on a customer instance and
+useless in a QA gate.
+
+A gating template therefore names what it demands actually ran:
+
+```yaml
+env:
+  INSTANCE_TEST_REQUIRE_PASS: "base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries"
+```
+
+Names match the results JSON exactly (path-relative, no `.sh` — e.g. `base/60-gpu-cuda`,
+`comfyui.d/10-comfyui-serving`). The gate catches three cases a per-test flag cannot:
+the test skipped, the test is **absent from the image**, and the test was never reached
+because an earlier `test_fatal` aborted the suite.
+
+### Provisioning test configuration
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROV_STALL_TIMEOUT` | `180` | Seconds with no activity before declaring hung |
+| `PROV_TIMEOUT` | `3600` | Maximum total provisioning time |
+
+### Instance variables (set by platform)
+| Variable | Description |
+|----------|-------------|
+| `CONTAINER_ID` | Instance ID (required) |
+| `CONTAINER_API_KEY` | API key for this instance (required) |
+| `SERVERLESS` | "true" if serverless mode |
+| `WORKSPACE` | Workspace directory path |
+| `PYTHON_VERSION` | Expected Python version for venv |
+| `PROVISIONING_MANIFEST` | URL/path to provisioning manifest |
+| `PROVISIONING_SCRIPT` | URL to legacy provisioning script |
+
+## Debugging
+
+```bash
+# Run all tests interactively (auto-detects TTY → manual mode)
+/opt/instance-tools/tests/runner.sh
+
+# Run a single test
+cd /opt/instance-tools/tests
+TEST_NAME=base/60-gpu-cuda bash base/60-gpu-cuda.sh
+
+# Run with simulated serverless mode
+SERVERLESS=true /opt/instance-tools/tests/runner.sh
+
+# Check cached instance metadata
+cat /tmp/instance-test-metadata.json | python3 -m json.tool
+
+# Read results
+cat /var/log/test-results.json | python3 -m json.tool
+```

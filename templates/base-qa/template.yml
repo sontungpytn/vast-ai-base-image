@@ -1,0 +1,225 @@
+# Base image QA template (ADR 0019 live-GPU gate for base-image promotion).
+#
+# WHAT THIS CERTIFIES. For an app image the product sits above the platform, so a
+# boot-and-curl gate would launder "booted" into "QA'd" (ADR 0005 option A, rejected).
+# For the base image there is nothing above the platform: supervisor, the portal,
+# Caddy's TLS/auth gate, the exposure scan, the python/venv layer and the CUDA
+# userland ARE the product. So the base/ suite is a real functional test here, and
+# base earns its allowlist seat honestly rather than by exemption.
+#
+# ADR 0010 EXEMPTION, stated rather than drifted: 0010 says one template per image,
+# with the QA gate booting the same file a user launches. Base cannot satisfy that —
+# its customer launch templates live on the Vast side, outside this repo — so this is
+# an approximation of a customer launch, and drift from the real Vast-side template is
+# a risk no check in here can detect. Keep the two in step by hand when either moves.
+#
+# CI overrides image/tag with the freshly-built staging tag via create.py --tag, and
+# raises cuda_max_good per config via create.py --set-filter (raise-only).
+name: "Base image QA — platform + GPU/CUDA suite"
+image: vastai/base-image
+tag: latest                       # CI overrides with the staging tag
+private: true
+readme_visible: false
+# --sync-home and --sync-environment are ON here, and deliberately WITHOUT a
+# volume. Boot stages 35 and 37 move /root, /home/* and /venv/* onto $WORKSPACE
+# and symlink them back; nothing in this repo exercised them, so a change to that
+# code first executed on a customer instance. That is how a bounded-wait fix
+# shipped with a `return 1` between the .ssh MOVE and the symlink back, which
+# would have left an instance booting green with key-based SSH dead.
+#
+# No volume is needed to exercise it: $WORKSPACE defaults to a container
+# directory and the lock, completion markers, wait, relinking and .ssh round-trip
+# are identical. Only the multi-instance race needs a shared volume, and that is
+# not what this gate is for. Measured cost on base: ~17s.
+onstart: entrypoint.sh --sync-home --sync-environment
+runtype: jupyter                  # production launch mode
+jup_direct: true
+ssh_direct: true
+use_ssh: true
+use_jupyter_lab: false
+ports:
+  - "1111:1111"                   # Instance Portal
+  - "8080:8080"                   # Jupyter
+  - "6006:6006"                   # Tensorboard
+  - "8384:8384"                   # Syncthing GUI (behind Caddy)
+  # Syncthing SYNC protocol. Mapped because the customer-facing template maps it,
+  # and until it was here the gate ran a configuration no customer runs: with the
+  # port unmapped, `syncthing.sh` built an address with an empty port, syncthing
+  # bound its own default (22000), and the `env:VAST_TCP_PORT_72299` allowlist
+  # entry resolved to nothing — so the one mechanism that entry exists to test had
+  # never executed in any QA run. The gate saw only the degenerate path, which is
+  # how the empty-port defect survived (ADR 0028).
+  - "72299:72299"                 # Syncthing sync protocol
+env:
+  OPEN_BUTTON_PORT: "1111"
+  OPEN_BUTTON_TOKEN: "1"
+  JUPYTER_DIR: "/"
+  DATA_DIRECTORY: "/workspace/"
+  # Only entries whose port actually binds: the harness's port check fails an entry
+  # pointing at a dead port. Tensorboard and Syncthing autostart in the base image
+  # (both observed RUNNING on a live instance), so including them exercises the
+  # Caddy-fronting path for real services rather than just the portal itself.
+  PORTAL_CONFIG: "localhost:1111:11111:/:Instance Portal|localhost:6006:16006:/:Tensorboard|localhost:8384:18384:/:Syncthing|localhost:8080:18080:/:Jupyter|localhost:8080:8080:/terminals/1:Jupyter Terminal"
+  # A skip is not a pass (ADR 0019). All three GPU tests open with
+  # `has_gpu || test_skip`, so on a box where nvidia-smi or libcuda never came up they
+  # skip themselves, the suite reports green, and the gate would certify an image whose
+  # CUDA userland — the ONLY thing that differs between the 12 configs — was never
+  # exercised. Naming them here makes that outcome red. Enforced twice: by the runner
+  # in-instance, and by qa_verdict.py in CI, so a template that lost this line still
+  # cannot produce a passing verdict. Gated by linter rule L057.
+  # 36 is required so it cannot skip its way to green: it self-skips when the
+  # sync flags are off, which is correct everywhere else and would be a hole here.
+  INSTANCE_TEST_REQUIRE_PASS: "base/36-home-env-sync base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries"
+  # Promote the exposure scan from advisory to gating, for base only (ADR 0006
+  # condition 2 always intended this flip once a clean baseline existed; base is
+  # the image that OWNS exposure-allowlist/00-base.conf, so its baseline is the
+  # one that can be shown clean).
+  #
+  # Until this line existed, 28-inadvertent-exposure ran on every cell, correctly
+  # identified a violation, printed it — and then PASSED, because
+  # EXPOSURE_ENFORCE defaults to false and no template set it. So the one field
+  # defect here with a customer-facing security consequence (an image inheriting
+  # an upstream EXPOSE and binding 0.0.0.0 past the auth proxy) was scanned for
+  # and reported as green. An advisory gate nobody ever promotes is a permanent
+  # pass.
+  #
+  # Costs no extra runtime: the scan already runs.
+  #
+  # CORRECTED (ADR 0028 binding condition 5). This used to claim the scan's own
+  # false-red source was "already handled" because an unattributable listener
+  # degrades to WARN rather than VIOLATION. That was documenting a guarantee that
+  # does not exist, and in the wrong direction: the degradation is not a false-red
+  # guard, it is a false-GREEN one. `ss -p` cannot attribute a socket owned by
+  # another uid without CAP_SYS_PTRACE, which Vast containers do not grant, so
+  # every service that drops privileges takes that branch — and WARNs do not set
+  # the return code. With EXPOSURE_ENFORCE true, this gate has been passing on
+  # precisely the listeners it cannot see. The ADR 0028 scanner runs in shadow
+  # alongside it and takes over after one clean promotion cycle.
+  EXPOSURE_ENFORCE: "true"
+# QA gate floors (ADR 0005): smallest viable box above the declared floors, VRAM
+# bounded at 3x so a small claim is never tested on a huge box.
+extra_filters:
+  # sm_75 (Turing). The base image compiles no kernels — the GPU suite runs
+  # nvidia-smi, a driver-API cuInit/alloc via ctypes, and library loads — so the real
+  # feature target is "a GPU generation this CUDA userland still supports". CUDA 13
+  # dropped pre-sm_75 anyway, and Turing+ is where the market is. Twelve different
+  # compute_cap floors would be false precision: this is the one axis where the
+  # configs genuinely do not differ.
+  compute_cap:
+    gte: 750
+  # MAJOR-baseline, not exact-minor, and raised per config at rent time.
+  #
+  # DIRECTION: this is a LOWER bound and must stay one. cuda_max_good is the newest
+  # CUDA a host's driver supports, so `gte: 11.8` matches an 11.8 host AND every
+  # newer one — a cuda-11.8 image landing on a 13.x-driver box is correct, because
+  # newer drivers run older CUDA. Most of the fleet has long since moved past 11.8,
+  # so those cells SHOULD be expected to run on much newer hosts. Never add an `lte`
+  # here: pinning to an exact generation would brick the older configs against a
+  # market that no longer has those drivers, while proving nothing extra.
+  #
+  # This is the axis where the configs DO differ, and it has to be right in both
+  # directions. Too low and a cuda-13.x image lands on a 12.x-driver host: when the
+  # compat libs fail to activate, 60-gpu-cuda calls test_fail on the major mismatch —
+  # a systematic false red that has nothing to do with the image. Too high (exact
+  # minor, e.g. >= 13.3) and every cell competes for the newest-driver tier on a thin
+  # amd64 market, which is how a gate starts flaking and then gets routed around.
+  #
+  # Major-baseline is not a compromise between those, it is the correct answer:
+  # NVIDIA guarantees minor-version compatibility within a major, 60-gpu-cuda's own
+  # same-major branch passes ("minor compat ok"), and a 13.0-driver host running the
+  # 13.3 toolkit is a configuration real customers land on — so testing it is
+  # representative rather than lenient.
+  #
+  # The value below is the FLOOR OF THE FLOOR; CI raises it per config to the
+  # image's OWN exact minor (13.3.1 -> 13.3) via --set-filter, which may only
+  # tighten. It was a major baseline (13.x -> 13.0) until 2026-08-14; measured
+  # supply showed that cost driver coverage on nine of ten configs and bought
+  # thinness relief only on the newest. See promote-base-image.yml.
+  cuda_max_good:
+    gte: 11.8
+  # PER-GPU, not the sum. gpu_total_ram lets a multi-GPU box of small cards clear the
+  # floor and then behave nothing like the target — observed live on the vLLM cu13.0
+  # cell, where GPU 0 was 9.64 GiB against a 16 GB *total* floor. The base image loads
+  # no model, so 8 GB is ample; with ADR 0005's 3x ceiling this selects the abundant
+  # 8-24 GB tier rather than the datacenter cards.
+  gpu_ram:
+    gte: 8192
+  # Cheap unreliable hosts fail in host-specific ways the image cannot fix: a truncated
+  # image pull ("unexpected eof") and a host with no outbound egress, both observed live
+  # on the vLLM gate. Base images are 10-20 GB pulls, so pull integrity matters more
+  # here, not less. Good hosts sit ~0.92-0.99.
+  reliability2:
+    gte: 0.95
+  # A host that forwards very few ports is usually not a plain datacentre box —
+  # it is proxied/VPN-fronted, and those hosts pull images pathologically slowly
+  # even when they ADVERTISE fast links. That last part is why this floor cannot be
+  # REPLACED by the inet_down floor above: measured against 930 live offers matching
+  # these same floors, hosts with <8 forwardable ports still advertised a median 253
+  # Mbps, so a bandwidth floor alone would not have excluded them. Reported bandwidth
+  # is a claim; port count is a structural property of how the host is connected. The
+  # two floors are complementary and neither subsumes the other — this one covers the
+  # host that overstates its link, inet_down covers the host that is honestly slow.
+  #
+  # Distribution across that sample: median 99, mode 64-127 (34%), and a thin tail
+  # of 17% below 32. gte 64 keeps ~751 offers — 75x what a promotion needs — while
+  # excluding that whole tail.
+  #
+  # DIRECTION: like cuda_max_good this is a LOWER bound and must stay one. An
+  # `lte` here would select FOR the restricted hosts this exists to avoid.
+  # Bandwidth floor. The cell pulls a multi-GB image before a single test can run,
+  # and that pull sits inside the launch window the client bounds with poll_timeout —
+  # so a slow link does not merely make the run late, it can burn the whole attempt
+  # and force a redraw (ADR 0029) on a host that had nothing wrong with the image.
+  #
+  # Measured against the live pool matching these same floors: median ~900 Mbps, but
+  # the bottom decile advertises 326-524 and the slowest offer 34 Mbps. At 34 Mbps a
+  # ~25 GB image is over an hour of pull before the suite starts; 500 bounds it to
+  # single-digit minutes and still keeps 65-88% of the pool depending on the template.
+  #
+  # This is COMPLEMENTARY to direct_port_count, not a replacement — the two exclude
+  # different failures, and neither subsumes the other. Advertised bandwidth is a
+  # claim, so this floor cannot catch a host that overstates its link; the port floor
+  # is what covers that. What this floor catches is the host that is honestly slow,
+  # which the port floor does not look at.
+  #
+  # DIRECTION: a LOWER bound. Tunable: raise toward 1000 if pulls still drag, at the
+  # cost of roughly two thirds of the offer pool.
+  inet_down:
+    gte: 500                      # Mbps
+  direct_port_count:
+    gte: 64
+  # THE DISK FLOOR THAT ACTUALLY FILTERS, and it is NOT about image size.
+  #
+  # On Vast the container image is stored separately and is not charged to the
+  # instance; the disk you request is the additional (overlayfs) space for whatever
+  # the instance writes — downloads, workspace, logs. So a big -devel image does NOT
+  # need a big disk request, and an offer with less disk than the image is not
+  # thereby unable to run it.
+  #
+  # What this floor prevents is narrower and purely mechanical: the client REQUESTS
+  # `recommended_disk_space` at create time, and rejects any instance that comes up
+  # with less than the full request (DISK_TOLERANCE). Without a matching search
+  # floor, offers are never filtered on available disk, so the client rents a box
+  # that cannot satisfy the request and only learns after launch — burning one of
+  # its bounded launch attempts.
+  #
+  # Sized to the request, and the request is small because the image is not in it.
+  # Measured across the other floors: no floor 753 offers, >=16 745, >=32 737,
+  # >=64 724. The old 64 GB cost 29 offers to reserve space this suite never writes.
+  #
+  # Keep this >= recommended_disk_space; a floor below it silently readmits offers
+  # that cannot satisfy the request. L058 checks that relationship, not merely the
+  # presence of a floor.
+  disk_space:
+    gte: 16
+# Overlayfs space requested for what the instance WRITES — not for the image, which
+# Vast stores separately and does not charge to the instance. The base suite
+# downloads no models and writes little beyond logs and provisioning scratch, so 16
+# GB is sized to the actual workload. It was 64 GB while the comment wrongly claimed
+# the disk had to hold the image; that reserved space nothing writes and cost 29
+# offers (724 vs 753 unfiltered).
+#
+# On its own this filters NOTHING — it is a request, not a constraint on selection.
+# The disk_space floor in extra_filters above is what keeps the client from renting
+# a box that cannot satisfy it. Both must move together; L058 enforces that.
+recommended_disk_space: 16.0

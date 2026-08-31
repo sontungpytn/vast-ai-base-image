@@ -1,35 +1,33 @@
 #!/bin/bash
+utils=/opt/supervisor-scripts/utils
+. "${utils}/logging.sh"
+. "${utils}/cleanup_generic.sh"
+. "${utils}/environment.sh"
+. "${utils}/exit_portal.sh" "oobabooga"
 
-# User can configure startup by removing the reference in /etc.portal.yaml - So wait for that file and check it
-while [ ! -f "$(realpath -q /etc/portal.yaml 2>/dev/null)" ]; do
-    echo "Waiting for /etc/portal.yaml before starting ${PROC_NAME}..." | tee -a "/var/log/portal/${PROC_NAME}.log"
-    sleep 1
-done
-
-# Check for oobabooga in the portal config
-search_term="oobabooga"
-search_pattern=$(echo "$search_term" | sed 's/[ _-]/[ _-]/g')
-if ! grep -qiE "^[^#].*${search_pattern}" /etc/portal.yaml; then
-    echo "Skipping startup for ${PROC_NAME} (not in /etc/portal.yaml)" | tee -a "/var/log/portal/${PROC_NAME}.log"
-    exit 0
-fi
-
-# Activate the venv
 . /venv/main/bin/activate
-
-# Wait for provisioning to complete
 
 while [ -f "/.provisioning" ]; do
     echo "$PROC_NAME startup paused until instance provisioning has completed (/.provisioning present)"
     sleep 10
 done
 
-# Avoid git errors because we run as root but files are owned by 'user'
 export GIT_CONFIG_GLOBAL=/tmp/temporary-git-config
 git config --file $GIT_CONFIG_GLOBAL --add safe.directory '*'
+
+# Bind the loopback ports UNCONDITIONALLY (additive, not a replaceable default) so
+# a launch template cannot drop them and re-expose the service. server.py / the
+# API bind 127.0.0.1 unless --listen is passed; we deliberately never pass it.
+# OOBABOOGA_ARGS may ADD extra args (incl. overriding the ports, which argparse
+# resolves last-wins), but injecting a bare `--listen` would flip both
+# Caddy-fronted ports to 0.0.0.0 — refuse to start in that case (ADR 0004).
+if [[ " ${OOBABOOGA_ARGS:-} " =~ (^|[[:space:]])--listen([[:space:]]|$) ]]; then
+    echo "$PROC_NAME refusing to start: a bare --listen in OOBABOOGA_ARGS would bind 0.0.0.0 on the Caddy-fronted ports (ADR 0004). Remove it; the app already binds loopback behind Caddy."
+    exit 1
+fi
 
 # Launch Oobabooga
 cd ${DATA_DIRECTORY}text-generation-webui
 LD_PRELOAD=libtcmalloc_minimal.so.4 \
-        python server.py \
-        ${OOBABOOGA_ARGS:---listen-port 17860 --api --api-port 15000} 2>&1 | tee -a "/var/log/portal/${PROC_NAME}.log"
+        pty python server.py \
+        --listen-port 17860 --api --api-port 15000 ${OOBABOOGA_ARGS:-} 2>&1

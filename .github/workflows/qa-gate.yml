@@ -1,0 +1,555 @@
+# Reusable live-GPU QA gate (ADR 0005). Image-agnostic: a build workflow
+# calls this once per staging artifact, passing the finished image coordinates +
+# the QA template. All per-image variation (tag derivation, matrix shape, the
+# provisioning/model env) stays in the CALLER; this job is just the shared core —
+# create a throwaway template -> launch + run the in-instance harness, DESTROYING
+# the instance -> delete the template -> map a machine-readable verdict.
+#
+# Caller pattern:
+#   qa:
+#     needs: [preflight, build]
+#     strategy: { matrix: { include: [ {cuda: "12.9", py: "py312"}, ... ] } }
+#     uses: ./.github/workflows/qa-gate.yml
+#     with: { repo: comfy, tag: "...-cuda-${{matrix.cuda}}-...-amd64", template_dir: ..., label: base-image-qa-<img>, ... }
+#     secrets: { VAST_API_KEY: ..., DOCKERHUB_NAMESPACE_STAGING: ..., SLACK_WEBHOOK_URL: ... }
+#   merge-manifests: { needs: [preflight, build, qa] }   # gated on qa
+name: QA gate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: "Dockerhub repo; the tested image is <staging-namespace>/<repo>"
+        required: true
+        type: string
+      tag:
+        description: "The amd64 staging tag to test (already derived by the caller)"
+        required: true
+        type: string
+      template_dir:
+        description: "Path to the QA template dir (<name>/template.yml)"
+        required: true
+        type: string
+      label:
+        description: "Vast instance label to stamp (reaper scope; prefix base-image-qa)"
+        required: true
+        type: string
+      log_paths:
+        description: "Space-separated in-instance log files to stream into the run"
+        required: false
+        type: string
+        default: ""
+      extra_env:
+        description: "Newline-separated KEY=VAL passed as test_template --env (e.g. a SHA-pinned provisioning URL)"
+        required: false
+        type: string
+        default: ""
+      max_price:
+        description: "Per-run $/hr cost cap (dph_total). Backstops the VRAM band, which bounds box size but not price."
+        required: false
+        type: string
+        default: "2.00"
+      timeout:
+        required: false
+        type: string
+        default: "7800"
+      require_floor:
+        description: "Fail if the template declares no parseable compute_cap floor"
+        required: false
+        type: boolean
+        default: true
+      # --- ADR 0019 additions. Every default reproduces today's behaviour exactly,
+      # so the existing comfyui/vllm callers are unaffected without touching them.
+      require_key:
+        description: >-
+          Fail (not skip) when VAST_API_KEY is absent. The default advisory-skip is a
+          deliberate rollout ramp, but for a consumer that calls itself a gate a missing
+          key silently turns gating back into no gating, with a green check.
+        required: false
+        type: boolean
+        default: false
+      require_tests:
+        description: >-
+          Space/comma-separated test names that must be PRESENT and PASSED in the
+          verdict payload. A skip is not a pass: the GPU trio skips itself when the
+          driver or CUDA userland is unavailable, and the suite then reports green.
+          This is the CI-side half of the runner's INSTANCE_TEST_REQUIRE_PASS gate —
+          it still fires if the template loses that env var.
+        required: false
+        type: string
+        default: ""
+      retries:
+        description: >-
+          Extra attempts on ANY failure except config_error (4) and interrupted
+          (130) — ADR 0029. Reproducibility, not symptom, is what separates a bad
+          host from a bad image: a defect in the image fails every draw and still
+          blocks once attempts are exhausted, while a bad host does not survive a
+          fresh draw. Each failed attempt records the machine it ran on and
+          excludes it from the next draw.
+
+          This SUPERSEDES the previous "infra-inconclusive only" rule, which
+          redrew only when no test had failed. That was written for a GPU-less
+          box, where the required-pass gate fires on skips; it could not help when
+          a bad host makes a real test FAIL, which is most of what happens.
+
+          config_error is never retried (our own bug — retrying hides it), and
+          neither is 130 (a cancellation is a decision, not a bad draw).
+
+          NOTE: a deterministic image defect blocks, but a FLAKY one can now pass
+          by luck, because one passing redraw ends the loop. That cost is accepted
+          in ADR 0029 and the suspect-machine record is what makes it visible.
+        required: false
+        type: number
+        default: 0
+      poll_timeout:
+        description: >-
+          Seconds to wait for an instance to reach "running" (boot + image pull)
+          before abandoning that offer and trying the next. Empty keeps the
+          client's default of 2400 (40 min), which suits a derivative pulling a
+          large model. An image whose whole test takes minutes should set this far
+          lower: a generous cap means one pathologically slow host burns the full
+          window before the client moves on, and it can do that once per launch
+          attempt.
+        required: false
+        type: string
+        default: ""
+      retry_delay:
+        description: "Seconds to wait between retries. A thin offer market does not change in 90s."
+        required: false
+        type: number
+        default: 300
+      evidence_name:
+        description: >-
+          Artifact name for this cell's verdict payload. Must be unique per matrix cell —
+          upload-artifact@v4 rejects duplicate names within a run. Empty = no upload.
+        required: false
+        type: string
+        default: ""
+      set_filters:
+        description: >-
+          Space-separated KEY.OP=VALUE floor overrides applied at template-create time
+          (e.g. "cuda_max_good.gte=13.0"). RAISE-ONLY — create.py rejects an override that
+          would widen selection, so the linted floors keep describing what gets rented.
+          Used by the base gate, whose 12 configs each need their own driver floor.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      VAST_API_KEY:
+        required: false
+      DOCKERHUB_NAMESPACE_STAGING:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+      HF_TOKEN:
+        description: >-
+          Optional READ-ONLY HuggingFace token, appended to the instance env as
+          HF_TOKEN when present. Passed as a secret rather than through extra_env so
+          it is registered for log masking and never appears in the argument list a
+          run step echoes. Only callers that need it pass it: the serverless cell
+          does, because pyworker's start_server.sh aborts with
+          "HF_TOKEN must be set when BACKEND is set!" before it ever reaches the
+          worker, and a cell that dies in the bootstrap decides nothing.
+        required: false
+    outputs:
+      gated:
+        description: "true if the live QA test actually ran (VAST_API_KEY present); false = advisory-skipped. Identical across matrix cells (repo-secret driven), so relaying it via needs.qa.outputs is matrix-safe — unlike a per-cell verdict."
+        value: ${{ jobs.qa.outputs.gated }}
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    # Hard backstop below the 6h GitHub cap. test_template.py's own timeouts sum
+    # to ~3h worst case (poll 40m + test ~130m + launch/setup), so it should
+    # self-terminate and destroy its instance well before this fires; 240m only
+    # catches a true hang, killing it at 4h (not 6h) to limit wasted minutes and
+    # the orphan window (the reaper still backstops). See ADR 0005 runtime budget.
+    timeout-minutes: 240
+    # soft_pass is set only when an unattended scheduled run promoted UNGATED
+    # (inconclusive infra outcome). notify-soft-pass below pings Slack so that
+    # silent no-op surfaces instead of decaying quietly.
+    outputs:
+      soft_pass: ${{ steps.verdict.outputs.soft_pass }}
+      gated: ${{ steps.guard.outputs.run }}   # did the live test actually run (secret present)
+    # NOTE: no account-wide concurrency group. A single `qa-vast-account` group
+    # (cancel-in-progress: false) only ever allows 1 running + 1 pending and
+    # CANCELS the rest — so >2 contending QA cells (two images at once, or one
+    # image with 3+ CUDA cells) cancel each other, and a cancelled qa job blocks
+    # `merge-manifests` (needs: [qa]). Concurrent QA DOES 429 the shared single-key
+    # account (observed live), so the fix is client-side, not serialization:
+    # `test_template.py` retries/backs off (with jitter) on 429/5xx, and the
+    # schedule soft-pass pings Slack. Bounded concurrency for the many-image rollout
+    # is a planned follow-up (an account-aware semaphore; ADR 0005 cond 6). Until
+    # then: run QA concurrently, relying on the client's rate-limit backoff.
+    env:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      TM: tools/template_manager
+      # Empty leaves the client's own default in place — _env_int treats unset and
+      # empty identically — so every existing consumer is untouched.
+      QA_POLL_TIMEOUT: ${{ inputs.poll_timeout }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate readiness (advisory until the QA account secret exists)
+        id: guard
+        run: |
+          if [ -z "${VAST_API_KEY}" ]; then
+            if [ "${{ inputs.require_key }}" = "true" ]; then
+              # A caller that gates promotion on this cannot treat a missing key as
+              # "skip, carry on" — that converts gating into no gating while still
+              # reporting green. Fail closed instead (ADR 0019 cond 3).
+              echo "::error::VAST_API_KEY not set and require_key=true — refusing to report a pass for a test that did not run."
+              exit 1
+            fi
+            echo "::warning::VAST_API_KEY not set — skipping live QA (advisory; promotion not blocked)."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install template_manager deps
+        if: steps.guard.outputs.run == 'true'
+        run: pip install -r "${TM}/requirements.txt"
+
+      - name: Create throwaway QA template
+        if: steps.guard.outputs.run == 'true'
+        id: create
+        env:
+          STAGING_NS: ${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}
+          SET_FILTERS: ${{ inputs.set_filters }}
+          QA_LABEL: ${{ inputs.label }}
+          QA_TAG: ${{ inputs.tag }}
+        run: |
+          IMAGE="${STAGING_NS}/${{ inputs.repo }}"
+          echo "Testing ${IMAGE}:${{ inputs.tag }}"
+          SF=()
+          for f in ${SET_FILTERS}; do SF+=(--set-filter "$f"); done
+          # --name-suffix is not cosmetic. Template creation UPSERTS on the NAME, so
+          # every cell launching from the same template file shares ONE throwaway
+          # template — and the first cell to finish deletes it out from under the
+          # rest. Measured on the SGLang gate: four cells produced two ids, the
+          # serverless cu129 cell deleted 607557 at 14:12:51, and the standard cu129
+          # cell got "invalid template hash or id or template not accessible by user"
+          # on every launch attempt after that instant, which read as a config_error
+          # and blocked the gate. label+tag is unique per cell, which is exactly the
+          # granularity that was missing.
+          python "${TM}/create.py" "${{ github.workspace }}/${{ inputs.template_dir }}" \
+            --image "${IMAGE}" --tag "${{ inputs.tag }}" \
+            --name-suffix "${QA_LABEL} ${QA_TAG}" \
+            "${SF[@]}" \
+            --emit-result /tmp/qa-create.json
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          r = json.load(open("/tmp/qa-create.json"))
+          assert r and r[0].get("hash_id") and r[0].get("id"), f"create returned no hash/id: {r}"
+          print(f"hash={r[0]['hash_id']}")
+          print(f"id={r[0]['id']}")
+          PY
+
+      - name: Run live test (DESTROY the instance after)
+        if: steps.guard.outputs.run == 'true'
+        id: test
+        continue-on-error: true
+        env:
+          LOG_PATHS: ${{ inputs.log_paths }}
+          QA_REPO: ${{ inputs.repo }}
+          QA_TAG: ${{ inputs.tag }}
+          EXTRA_ENV: ${{ inputs.extra_env }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          ARGS=()
+          for p in ${LOG_PATHS}; do ARGS+=(--log "$p"); done
+          # extra_env is a BLOCK callers document in place — the serverless cells carry
+          # several lines of rationale each. Skip blanks and comments rather than
+          # forwarding them: test_template.py rejects any --env without an '=' with
+          # "Invalid --env format", which surfaces as config_error (exit 4), and
+          # config_error is deliberately never retried, so the cell just blocks. Measured
+          # 2026-08-27 on the first ComfyUI serverless cell ever run, and latent at the
+          # same moment in build-sglang, build-llama-cpp and promote-base-image's
+          # detection cell — including the base PROMOTION gate.
+          #
+          # This also makes the harness agree with the LINTER, which already skips '#'
+          # lines when it reads this same field (_serverless_gate_callers). Two parsers
+          # disagreeing about the same text is what made a comment look legal.
+          #
+          # Only a line STARTING with '#' is a comment; a '#' inside a value is data.
+          while IFS= read -r kv; do
+            _t="${kv#"${kv%%[![:space:]]*}"}"          # lstrip
+            [ -z "$_t" ] && continue                    # blank / whitespace-only
+            [ "${_t:0:1}" = "#" ] && continue           # comment
+            ARGS+=(--env "$kv")
+          done <<< "${EXTRA_ENV}"
+          # Appended here rather than folded into extra_env by the caller: a secret
+          # reaching the instance must not travel through an input, which is plain
+          # text in the caller's YAML and in the job's own `with` context.
+          [ -n "${HF_TOKEN:-}" ] && ARGS+=(--env "HF_TOKEN=${HF_TOKEN}")
+          if [ "${{ inputs.require_floor }}" = "true" ]; then ARGS+=(--require-floor); fi
+
+          # Retry ANY failure except config_error (4) and interrupted (130), and
+          # exclude the machine that failed (ADR 0029). Reproducibility rather than
+          # symptom is the discriminator: an image defect fails every draw and
+          # still blocks when attempts run out; a bad host does not survive a fresh
+          # one. Retrying a red does risk passing by luck — that cost is accepted
+          # in ADR 0029, bounded by the attempt count, and made visible by the
+          # per-attempt machine record.
+          ATTEMPTS=$(( ${{ inputs.retries }} + 1 ))
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            [ "$attempt" -gt 1 ] && echo "::notice::attempt ${attempt}/${ATTEMPTS} after an inconclusive market result"
+            set +e
+            # EXCLUDE THE MACHINES THAT ALREADY FAILED THIS CELL. The client's own
+            # machine blacklist lives inside one process, and this loop starts a
+            # fresh one per attempt — so without this the redraw re-picks the SAME
+            # box, because offers are searched cheapest-first and the cheapest has
+            # not changed. Observed live 2026-08-19 (run 32236327488): a cell
+            # redrew onto the host it had just failed on, which is the one outcome
+            # the redraw exists to avoid.
+            EXCL=()
+            if [ -s /tmp/qa-suspect-hosts.txt ]; then
+              for _m in $(cut -d'|' -f1 /tmp/qa-suspect-hosts.txt | grep -E '^[0-9]+$' | sort -u); do
+                EXCL+=(--exclude-machine "$_m")
+              done
+            fi
+            [ ${#EXCL[@]} -gt 0 ] && echo "excluding already-failed machines: ${EXCL[*]}"
+            python "${TM}/test_template.py" "${{ steps.create.outputs.hash }}" \
+              --destroy --raw --force --label "${{ inputs.label }}" \
+              --max-price "${{ inputs.max_price }}" --timeout "${{ inputs.timeout }}" \
+              "${EXCL[@]}" \
+              "${ARGS[@]}" \
+              > /tmp/qa-raw.json
+            CODE=$?
+            set -e
+            # WHY we may retry, which is not the same as the code we retry ON.
+            # Exit 2 from the client means the market had nothing; the redraw
+            # below ALSO sets CODE=2, for a host that failed. Both wait, but for
+            # opposite reasons, and only one of them is worth waiting long for.
+            _RETRY_REASON="no_offers"
+            # The client's REAL exit code, before the loop rewrites it. CODE=2 is a
+            # LOOP-CONTROL flag ("go round again"); it is not a verdict. Emitting it
+            # as the verdict aliases a real test failure onto EXIT_NO_OFFERS, which
+            # qa_verdict.py short-circuits to `inconclusive` — and on the scheduled
+            # comfyui/vllm gates `inconclusive` soft-passes and PROMOTES UNGATED.
+            _REAL_CODE=$CODE
+            echo "---- attempt ${attempt} verdict ----"; cat /tmp/qa-raw.json || echo "(no --raw output)"
+
+            # DRAW ANOTHER HOST ON ANY FAILURE, AND NAME THE HOST.
+            #
+            # Reproducibility is the discriminator, not the symptom. A defect in
+            # the IMAGE reproduces on every box we draw, so it still blocks once
+            # the attempts are exhausted. A defect in the HOST does not survive a
+            # fresh draw. Deciding from a single run cannot tell them apart, and
+            # the 2026-08-18 pytorch gate proved it: six cells blocked, and every
+            # one that was investigated passed on other hardware — an NCCL
+            # segfault inside libcuda on machine 35974 (two controls on the
+            # identical driver build passed), two multi-GPU collectives timeouts
+            # (the same test then passed 10/10 on the same GPU model, driver and
+            # image digest), and three supervisord boot races.
+            #
+            # This supersedes the narrower rule that only redrew when NO test had
+            # failed. That rule was written for a GPU-less box, where the required
+            # -pass gate fires on skips; it could not help when a host makes a
+            # real test fail, which is most of what actually happened.
+            #
+            # The cost is real and accepted: retrying a red risks passing by luck.
+            # Two things bound it — the attempt count, and the fact that a genuine
+            # image defect has to pass EVERY redraw to escape, not just one.
+            #
+            # NOT 4 (config_error): that is our bug, and retrying hides it.
+            # NOT 4 (config_error: our bug, retrying hides it) and NOT 130
+            # (interrupted: qa_verdict calls a cancellation "not a pass", and a
+            # cancelled run is a decision someone made, not a bad draw).
+            if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 4 ] && [ "$CODE" -ne 2 ] && [ "$CODE" -ne 130 ]; then
+              # Name the box before redrawing. A machine that fails a test the
+              # image passes elsewhere is a de-verification candidate, and that is
+              # only actionable if the machine id is recorded at the moment it
+              # failed — the instance is destroyed immediately afterwards.
+              # Take the LAST complete {...} line, never the whole file — the same
+              # parse qa_verdict.py documents, after a whole-file parse once
+              # "turned a real PASS into a BLOCK". Anything the client prints on
+              # stdout alongside the payload would otherwise make jq fail, leave
+              # _mid empty, and the redraw would land back on the failed host.
+              grep '^{.*}$' /tmp/qa-raw.json 2>/dev/null | tail -n1 > /tmp/qa-raw-last.json || : > /tmp/qa-raw-last.json
+              _mid=$(jq -r '.machine_id // empty' /tmp/qa-raw-last.json 2>/dev/null || echo "")
+              _iid=$(jq -r '.instance_id // empty' /tmp/qa-raw-last.json 2>/dev/null || echo "")
+              _failed_names=$(jq -r '[.tests[]? | select(.state=="failed") | .name] | join(",")' /tmp/qa-raw-last.json 2>/dev/null || echo "")
+              echo "SUSPECT-HOST machine=${_mid:-unknown} instance=${_iid:-unknown} exit=${CODE} failed=${_failed_names:-none}"
+              echo "${_mid:-unknown}|${_iid:-unknown}|${CODE}|${_failed_names:-none}" >> /tmp/qa-suspect-hosts.txt
+              echo "::warning::cell failed on machine ${_mid:-unknown} (exit ${CODE}, failed: ${_failed_names:-none}) — drawing another host; if a redraw passes, this machine is a de-verification candidate"
+              CODE=2      # treat as inconclusive: retry on a fresh offer
+              _RETRY_REASON="host"
+            fi
+
+            [ "$CODE" -ne 2 ] && break
+            if [ "$attempt" -lt "$ATTEMPTS" ]; then
+              if [ "$_RETRY_REASON" = "host" ]; then
+                # A HOST failed. The market is not thin — there is nothing to wait
+                # for, and the machine that failed is now excluded, so the next
+                # draw is a different box. Waiting the market backoff here cost
+                # ~7 minutes per redraw for no reason. A small jitter only, so a
+                # matrix of cells does not re-enter the single-key QA account in
+                # lockstep (ADR 0005 cond 6).
+                _delay=$(( 5 + RANDOM % 20 ))
+                echo "host fault; drawing another machine in ${_delay}s"
+              else
+                # Genuinely no offers matched the floors. Here the wait IS the
+                # point: capacity has to appear. Jitter up to +50% for the same
+                # lockstep reason.
+                _delay=$(( ${{ inputs.retry_delay }} + RANDOM % ((${{ inputs.retry_delay }} / 2) + 1) ))
+                echo "no offers matched the floors; waiting ${_delay}s before retrying"
+              fi
+              sleep "$_delay"
+            fi
+          done
+          # Emit what actually happened on the LAST attempt, never the loop flag.
+          echo "exit_code=${_REAL_CODE}" >> "$GITHUB_OUTPUT"
+          echo "attempts=${attempt}" >> "$GITHUB_OUTPUT"
+          # Surfaced, not just recorded. ADR 0029's "what would reverse this"
+          # cites the redraw RATE, and an output nothing reads cannot show it.
+          if [ "${attempt}" -gt 1 ]; then
+            echo "### QA redraws — ${QA_REPO} \`${QA_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "This cell took **${attempt}** attempts (final exit ${_REAL_CODE})." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::cell needed ${attempt} attempts (final exit ${_REAL_CODE})"
+          fi
+          if [ -s /tmp/qa-suspect-hosts.txt ]; then
+            echo "suspect-hosts<<SUSPECT_EOF" >> "$GITHUB_OUTPUT"
+            cat /tmp/qa-suspect-hosts.txt >> "$GITHUB_OUTPUT"
+            echo "SUSPECT_EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A machine that failed a cell which then PASSED on another box is the
+      # actionable case: the image is exonerated by the redraw, so the fault is
+      # the host and it should be de-verified. If the cell never passed, the same
+      # machine list is NOT evidence against those hosts — the image is still a
+      # live suspect — so the two are reported differently rather than as one
+      # undifferentiated list.
+      - name: Report suspect hosts
+        if: always() && steps.test.outputs.suspect-hosts != ''
+        env:
+          SUSPECTS: ${{ steps.test.outputs.suspect-hosts }}
+          FINAL_CODE: ${{ steps.test.outputs.exit_code }}
+          # Via env:, not spliced into bash. Two reasons, and the second is why
+          # the previous version could not be tested at all: a dispatch input is
+          # free text, and wfexec.step_script REFUSES a step carrying an
+          # unresolved expression rather than guess at it — so an untestable step
+          # stayed untested, which is how three grep-only guards shipped here.
+          QA_REPO: ${{ inputs.repo }}
+          QA_TAG: ${{ inputs.tag }}
+        run: |
+          {
+            if [ "${FINAL_CODE}" = "0" ]; then
+              echo "### De-verification candidates — ${QA_REPO} \`${QA_TAG}\`"
+              echo ""
+              echo "These machines failed, then the SAME image passed on a fresh draw."
+              echo "The redraw exonerates the image, so the host is the fault:"
+            else
+              echo "### Failed hosts (image NOT exonerated) — ${QA_REPO} \`${QA_TAG}\`"
+              echo ""
+              echo "The cell never passed, so these are NOT de-verification"
+              echo "candidates — the image is still a live suspect:"
+            fi
+            echo ""
+            echo "| machine | instance | exit | failed tests |"
+            echo "|---|---|---|---|"
+            while IFS='|' read -r m i c f; do
+              # Skip rows with no machine. exit 3 (bad_instance) is emitted before
+              # any machine is bound, so it records `unknown` — and presenting
+              # that under "de-verification candidates" is a wrong accusation
+              # with no way to act on it.
+              case "$m" in ''|unknown) continue;; esac
+              echo "| \`$m\` | $i | $c | $f |"
+            done <<< "${SUSPECTS}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${SUSPECTS}"
+
+      - name: Delete the throwaway template (always)
+        if: always() && steps.create.outputs.id != ''
+        run: |
+          python "${TM}/create.py" --delete "${{ steps.create.outputs.id }}" \
+            || echo "::warning::template ${{ steps.create.outputs.id }} delete failed (HTTP error) — harmless private-template clutter; the instance was already destroyed"
+
+      - name: Verdict
+        id: verdict
+        if: steps.guard.outputs.run == 'true'
+        run: |
+          CODE="${{ steps.test.outputs.exit_code }}"
+          # The decision (pass / block / inconclusive) lives in qa_verdict.py — pure,
+          # unit-tested, and the place the required-tests assertion is enforced. It
+          # also owns the "take the last complete {...} line" parsing: a whole-file
+          # parse once silently turned a real PASS into a BLOCK on the cu12.9 cell.
+          # This step keeps only the POLICY: what to do with an inconclusive.
+          # NEVER eval this tool's stdout. A reason legitimately contains spaces,
+          # ';' and '()' ("3 required test(s) passed"), so under bash -e an eval is a
+          # syntax error that fails the step on a PASSING cell — and this workflow is
+          # shared with the live comfyui/vllm gates. The tool appends verdict=/reason=
+          # to $GITHUB_OUTPUT itself; we read the key back.
+          python "${TM}/qa_verdict.py" \
+            --exit-code "${CODE}" \
+            --raw /tmp/qa-raw.json \
+            --require-tests "${{ inputs.require_tests }}"
+          verdict=$(sed -n 's/^verdict=//p' "$GITHUB_OUTPUT" | tail -n1)
+          echo "exit_code=${CODE} verdict=${verdict}"
+
+          case "${verdict}" in
+            pass)
+              echo "::notice::FULL pass (see the verdict line above)"
+              exit 0 ;;
+            block)
+              echo "::error::BLOCK (see the verdict line above)"
+              exit 1 ;;
+            inconclusive)
+              # ADR 0005: a gating path HOLDS so a human looks; only the unattended
+              # schedule soft-passes, so a thin 00:00 market cannot block the nightly
+              # promotion of an unchanged image.
+              echo "::warning::INCONCLUSIVE (see the verdict line above)"
+              if [ "${{ github.event_name }}" = "schedule" ]; then
+                # Set BEFORE the exit so the output is written; notify-soft-pass pings
+                # Slack, because a gate that chronically cannot run must surface rather
+                # than decay into a no-op.
+                echo "soft_pass=true" >> "$GITHUB_OUTPUT"
+                echo "::warning::scheduled run promoted UNGATED (no live QA ran) — Slack alerted"
+                exit 0
+              fi
+              exit 1 ;;
+            *)
+              echo "::error::qa_verdict returned no usable verdict (${verdict:-<empty>})"
+              exit 1 ;;
+          esac
+
+      # Per-cell evidence for the approval summary: the verdict payload names the
+      # GPU, driver, digest and per-test states the decision was actually made on.
+      # `always()` so a BLOCKed cell — the one a human most needs to read — still
+      # uploads. The name must be unique per matrix cell; upload-artifact@v4 rejects
+      # duplicates within a run.
+      - name: Upload verdict evidence
+        if: always() && inputs.evidence_name != '' && steps.guard.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.evidence_name }}
+          path: /tmp/qa-raw.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # When an unattended scheduled run soft-passed (promoted UNGATED on an infra-
+  # inconclusive outcome), ping Slack. Real test failures BLOCK the qa job, so
+  # this never runs for those — it exists solely so a silently-skipped gate on the
+  # release train surfaces instead of decaying to a no-op (review follow-up).
+  notify-soft-pass:
+    needs: qa
+    if: needs.qa.outputs.soft_pass == 'true'
+    uses: ./.github/workflows/notify-slack.yml
+    with:
+      build-result: "success"   # it DID promote (ungated) — a warning, not a build failure
+      status: "warning"         # ⚠️ yellow, and render the promoted tag
+      headline: "${{ inputs.repo }} promoted UNGATED — scheduled QA inconclusive (thin market / infra); no live test ran"
+      image-name: ${{ inputs.repo }}
+      image-ref: ${{ inputs.tag }}
+      image-tags: ${{ format('["{0}"]', inputs.tag) }}
+      trigger: "schedule — QA inconclusive"
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

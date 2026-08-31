@@ -11,12 +11,22 @@ import aiohttp
 from urllib.parse import urlparse
 from cachetools import TTLCache
 import ipaddress
+import logging
 
 cloudflare_metrics = os.environ.get("CLOUDFLARE_METRICS", "localhost:11113")
 public_ipaddr = None
 app = FastAPI()
 
+
 CLOUDFLARED_BIN = "/opt/portal-aio/tunnel_manager/cloudflared"
+
+# The quick-tunnel URL cloudflared prints on startup. A module constant, not an
+# inline literal, so the contract test asserts against the SAME pattern the code
+# uses — a copy in the test would keep passing after this one drifted. cloudflared
+# is fetched unpinned at build time (releases/latest), so its output format is a
+# third-party contract that can move under us; test_cloudflared_contract.py is
+# what turns that from a silent breakage into a red build.
+QUICK_TUNNEL_URL_RE = re.compile(r'(https://\w+(-\w+){1,}\.trycloudflare\.com)')
 CF_TUNNEL_TOKEN = os.environ.get('CF_TUNNEL_TOKEN')
 cloudflared_account_process: Optional[asyncio.subprocess.Process] = None
 
@@ -31,17 +41,55 @@ def load_config():
     yaml_path = '/etc/portal.yaml'
     if os.path.exists(yaml_path):
         with open(yaml_path, 'r') as file:
-            config_applications = yaml.safe_load(file)['applications']
+            data = yaml.safe_load(file) or {}
+            config_applications = data.get('applications', {})
             return hydrate_applications(config_applications)
-        
+    return {}
+
 def hydrate_applications(applications):
+    # External ports that Caddy actually proxies — an entry whose internal port
+    # differs from its external port. For these, Caddy owns the listener and its
+    # scheme follows ENABLE_HTTPS.
+    proxied_external_ports = {
+        app["external_port"]
+        for app in applications.values()
+        if app["external_port"] != app["internal_port"]
+    }
     for app_name, app in applications.items():
-        if app["external_port"] == app["internal_port"] and app["internal_port"] == 8080:
+        # A straight-through :8080 entry (external == internal == 8080) is served
+        # over TLS directly by Vast launch-mode Jupyter — BUT only when nothing
+        # else is proxying :8080. In supervisor mode :8080 is the proxied Jupyter
+        # entry (8080->18080) plus a :8080->:8080 frontend alias for the terminal;
+        # there Caddy owns the listener, so the alias must follow ENABLE_HTTPS too,
+        # otherwise its target_url would point https at an http listener (and
+        # split into a second, broken tunnel). Detecting the proxy entry lets us
+        # tell the two modes apart from the config shape alone, which also covers
+        # the --jupyter-override case (proxied :8080 even though /.launch exists).
+        if (
+            app["external_port"] == app["internal_port"]
+            and app["internal_port"] == 8080
+            and 8080 not in proxied_external_ports
+        ):
             scheme = "https"
         else:
             scheme = get_scheme()
         applications[app_name]["target_url"] = f'{scheme}://{app["hostname"]}:{app["external_port"]}'
     return applications
+
+def get_scheme_for_external_port(port: int) -> str:
+    """Scheme actually served on a given external port.
+
+    Derived from the hydrated portal config so it stays consistent with the
+    tunnel target_urls (and with hydrate_applications' launch-mode handling):
+    a straight-through :8080 entry is direct TLS only when nothing else proxies
+    :8080 (launch-mode Jupyter); in supervisor mode Caddy owns the listener and
+    the scheme follows ENABLE_HTTPS. Falls back to get_scheme() for ports that
+    aren't in the portal config.
+    """
+    for app in load_config().values():
+        if app["external_port"] == port:
+            return urlparse(app["target_url"]).scheme
+    return get_scheme()
 
 # Function to fetch the public IP address
 def get_public_ip():
@@ -74,10 +122,10 @@ def get_port_mapping(port: int):
     # Fetch the public IP
     public_ip = get_public_ip()
 
-    if os.environ.get("ENABLE_HTTPS", "false").lower() == "true" or port == 8080:
-        scheme = "https://"
-    else:
-        scheme = "http://"
+    # Match the scheme Caddy/the service actually serves on this external port
+    # rather than hard-coding https for :8080 (which is only correct in
+    # launch mode, not when Caddy serves :8080 over http in supervisor mode).
+    scheme = get_scheme_for_external_port(port)
 
     # Fetch the environment variable dynamically
     env_var_name = f"VAST_TCP_PORT_{port}"
@@ -87,7 +135,7 @@ def get_port_mapping(port: int):
         raise HTTPException(status_code=404, detail=f"Environment variable {env_var_name} not found")
 
     # Return the {PUBLIC_IP}:{PORT_VALUE}
-    return {"result": f"{scheme}{public_ip}:{port_value}"}
+    return {"result": f"{scheme}://{public_ip}:{port_value}"}
 
 class QuickTunnel:
     def __init__(self, target_url: str):
@@ -110,7 +158,14 @@ class QuickTunnel:
         """Start the cloudflared process and capture the tunnel URL."""
         try:
             self.process = await asyncio.create_subprocess_exec(
-                CLOUDFLARED_BIN, '--no-tls-verify', '--url', self.target.geturl(),
+                # --no-autoupdate: cloudflared otherwise replaces its own binary
+                # in a running customer instance, unreviewed, and restarts itself
+                # to do it — which under supervisord reads as churn and makes a
+                # genuine failure harder to see. The version that ships is decided
+                # at build time and validated by the contract test; it must not
+                # change underneath a running instance.
+                CLOUDFLARED_BIN, '--no-autoupdate', '--no-tls-verify',
+                '--url', self.target.geturl(),
                 env = os.environ.copy(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT
@@ -129,7 +184,7 @@ class QuickTunnel:
                     line_str = line.decode().strip()
                     print(f"[{self.target.geturl()}] {line_str}")
                     # Avoid error response URLS on the trycloudflare domain
-                    match = re.search(r'(https://\w+(-\w+){1,}\.trycloudflare\.com)', line_str)
+                    match = QUICK_TUNNEL_URL_RE.search(line_str)
                     if match:
                         self.tunnel_url = match.group(1)
                         return self.tunnel_url
@@ -215,7 +270,8 @@ class CloudflareDaemon:
         try:
             async def start_process():
                 self.process = await asyncio.create_subprocess_exec(
-                    CLOUDFLARED_BIN, 'tunnel', '--metrics', self.metrics, 
+                    CLOUDFLARED_BIN, '--no-autoupdate', 'tunnel',
+                    '--metrics', self.metrics,
                     'run', '--token', self.token,
                     env = os.environ.copy(),
                     stdout=asyncio.subprocess.PIPE,
@@ -439,11 +495,79 @@ async def get_named_tunnel(port: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+async def _create_default_tunnels():
+    """Create quick tunnels for all configured apps.
+
+    Runs as a background task so the API server is available immediately
+    (otherwise /get-direct-url etc. return 500 while tunnels are being
+    created).
+    """
+    try:
+        config = load_config()
+
+        # Only one tunnel per external port. Several portal entries can share
+        # an external port: supervisor-managed Jupyter exposes :8080 for the
+        # app proxied from :18080 plus a :8080->:8080 entry that exists purely
+        # as a frontend alias (the terminal). Caddy collapses these into a
+        # single :8080 listener, so a second tunnel for the same external port
+        # is redundant. hydrate_applications already gives both entries the same
+        # scheme (so they share a target_url), but gating on the external port
+        # guarantees a single tunnel regardless of any future scheme divergence.
+        # Prefer the proxied entry (internal_port != external_port) so the
+        # surviving tunnel's scheme matches what Caddy actually serves.
+        selected = {}  # external_port -> app_name
+        for app_name, app_config in config.items():
+            ext = app_config['external_port']
+            prev = selected.get(ext)
+            if prev is None or (
+                config[prev]['internal_port'] == ext
+                and app_config['internal_port'] != ext
+            ):
+                selected[ext] = app_name
+
+        unique_targets = {}  # target_url -> app_name
+        for app_name in selected.values():
+            unique_targets[config[app_name]['target_url']] = app_name
+
+        # Create tunnels sequentially with a small delay between each
+        # to avoid hitting Cloudflare's rate limiter on quick tunnel
+        # creation.  Failed tunnels are retried with longer back-off.
+        failed_targets = []
+        for i, target_url in enumerate(unique_targets):
+            app_name = unique_targets[target_url]
+            if i > 0:
+                await asyncio.sleep(2)
+            try:
+                tunnel = await get_or_create_quick_tunnel(target_url)
+                print(f"Default Tunnel started for {app_name} ({target_url}) - {tunnel.tunnel_url}")
+            except Exception as e:
+                print(f"Failed to create default tunnel for {app_name} ({target_url}): {e}")
+                failed_targets.append(target_url)
+
+        # Retry failed tunnels with increasing back-off
+        for target_url in failed_targets:
+            app_name = unique_targets[target_url]
+            for attempt in range(1, 4):
+                delay = attempt * 10
+                print(f"Retrying tunnel for {app_name} ({target_url}) in {delay}s (attempt {attempt}/3)")
+                await asyncio.sleep(delay)
+                try:
+                    tunnel = await get_or_create_quick_tunnel(target_url)
+                    print(f"Default Tunnel started for {app_name} ({target_url}) - {tunnel.tunnel_url}")
+                    break
+                except Exception as e:
+                    print(f"Retry {attempt}/3 failed for {app_name} ({target_url}): {e}")
+    except Exception as e:
+        print(f"Error creating default tunnels: {e}")
+
+
 @app.on_event("startup")
 async def startup_event():
+    # Suppress uvicorn access logs after uvicorn has configured its loggers.
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     try:
         # Monitor quick tunnels in case user kills them
-        monitor_task = asyncio.create_task(monitor_processes())
+        asyncio.create_task(monitor_processes())
 
         # Create the main cloudflared process to handle named tunnels
         global cloudflared_account_process
@@ -454,38 +578,10 @@ async def startup_event():
                 print("Named tunnel process started")
             except Exception as e:
                 print(f"Failed to start named tunnel process: {str(e)}")
-        
-        try:
-            # Track unique ports and their first app name
-            config = load_config()
-            unique_targets = {}
-            for app_name, app_config in config.items():
-                target = app_config['target_url']
-                if target not in unique_targets:
-                    unique_targets[target] = app_name
 
-            # Create tunnels only for unique ports
-            tunnel_tasks = []
-            for target in unique_targets.keys():
-                try:
-                    task = get_or_create_quick_tunnel(f"{target}")
-                    tunnel_tasks.append(task)
-                except Exception as e:
-                    print(f"Failed to create tunnel task for {target}: {e}")
-
-            if tunnel_tasks:
-                default_tunnels = await asyncio.gather(*tunnel_tasks)
-
-            # Print results
-            for port, result in zip(unique_targets.keys(), default_tunnels):
-                app_name = unique_targets[target]
-                if isinstance(result, Exception):
-                    print(f"Failed to create default tunnel for {port}: {str(result)}")
-                elif result:
-                    print(f"Default Tunnel started for {port} - {result.tunnel_url}?token={os.environ.get('OPEN_BUTTON_TOKEN')}")
-        except:
-            # User can still create tunnels in the UI
-            pass
+        # Create default tunnels in the background so the API server
+        # starts accepting requests immediately (e.g. /get-direct-url).
+        asyncio.create_task(_create_default_tunnels())
     except Exception as e:
         print(f"Startup failed: {str(e)}")
         raise

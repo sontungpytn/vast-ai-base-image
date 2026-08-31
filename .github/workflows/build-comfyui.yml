@@ -1,0 +1,424 @@
+# Build ComfyUI image — runs on schedule and via manual `workflow_dispatch` on the main repo (and via manual dispatch on forks).
+# Required repository secrets:
+# DOCKERHUB_USERNAME
+# DOCKERHUB_TOKEN
+# DOCKERHUB_NAMESPACE          - production namespace (final multi-arch index lives here)
+# DOCKERHUB_NAMESPACE_STAGING  - staging namespace (per-arch build artifacts live here)
+# Optional:
+# SLACK_WEBHOOK_URL
+# Note: Build matrix will need periodic updates as new Pytorch images become available
+#
+# Multi-arch strategy: each (base_image, arch) pair builds natively on the
+# matching runner (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64) and
+# pushes an arch-suffixed tag to the STAGING namespace (-amd64 / -arm64).
+# A per-base_image merge job then uses crane to assemble the multi-arch index
+# at the PRODUCTION tag, sourcing the per-arch manifests from staging.
+# Cross-repo blob mounts keep the merge registry-side (no host streaming).
+# No QEMU emulation.
+
+name: Build ComfyUI Image
+
+on:
+  schedule:
+    # Run every 12 hours
+    - cron: '0 0,12 * * *'
+
+  workflow_dispatch:
+    inputs:
+      COMFYUI_REF:
+        description: "ComfyUI git ref - leave empty for latest"
+        required: false
+      DOCKERHUB_REPO:
+        description: "Push to username/<repo>"
+        required: true
+        default: "comfy"
+      CUSTOM_IMAGE_TAG:
+        description: "Custom tag (Auto default)"
+        required: false
+
+env:
+  DEFAULT_COMFYUI_REF: "master"
+  DEFAULT_DOCKERHUB_REPO: "comfy"
+  # 12 hours
+  RELEASE_AGE_THRESHOLD: 43200
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.decision.outputs.should-run }}
+      comfyui-ref: ${{ steps.release-check.outputs.resolved-ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for required secrets
+        id: secrets
+        run: |
+          missing=()
+          [[ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]] && missing+=("DOCKERHUB_USERNAME")
+          [[ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]] && missing+=("DOCKERHUB_TOKEN")
+          [[ -z "${{ secrets.DOCKERHUB_NAMESPACE }}" ]] && missing+=("DOCKERHUB_NAMESPACE")
+          [[ -z "${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}" ]] && missing+=("DOCKERHUB_NAMESPACE_STAGING")
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "Required secrets configured"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::notice::Skipping - missing secrets: ${missing[*]}"
+          fi
+
+      - name: Check release and resolve ref
+        id: release-check
+        uses: ./.github/actions/check-github-release
+        with:
+          repository: Comfy-Org/ComfyUI
+          age-threshold-seconds: ${{ env.RELEASE_AGE_THRESHOLD }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          trigger: ${{ github.event_name }}
+          manual-ref: ${{ inputs.COMFYUI_REF }}
+          default-ref: master
+
+      - name: Determine if build should run
+        id: decision
+        run: |
+          if [[ "${{ steps.secrets.outputs.available }}" == "true" && "${{ steps.release-check.outputs.new-release }}" == "true" ]]; then
+            echo "should-run=true" >> $GITHUB_OUTPUT
+            echo "Building ref: ${{ steps.release-check.outputs.resolved-ref }}"
+          else
+            echo "should-run=false" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: preflight
+    if: needs.preflight.outputs.should-run == 'true'
+    runs-on: ${{ matrix.arch.runs_on }}
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        base_image:
+          - vastai/pytorch:2.10.0-cu128-cuda-12.9-mini-py312-2026-08-26
+          - vastai/pytorch:2.10.0-cu130-cuda-13.2-mini-py312-2026-08-26
+        arch:
+          - { platform: linux/amd64, suffix: amd64, runs_on: ubuntu-latest }
+          - { platform: linux/arm64, suffix: arm64, runs_on: ubuntu-24.04-arm }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        uses: ./.github/actions/maximize-build-space
+
+      - name: Derive image tag
+        run: |
+          PYTORCH_BASE="${{ matrix.base_image }}"
+          TAG="${PYTORCH_BASE##*:}"
+
+          CUDA_VERSION=$(echo "$TAG" | sed -n 's/.*cuda-\([0-9.]*\).*/\1/p')
+          PYTHON_VERSION=$(echo "$TAG" | sed -n 's/.*-py\([0-9]*\).*/py\1/p')
+
+          if [ -z "$CUDA_VERSION" ] || [ -z "$PYTHON_VERSION" ]; then
+            echo "Failed to parse base image: $PYTORCH_BASE"
+            exit 1
+          fi
+
+          IMAGE_TAG_BASE="${{ inputs.CUSTOM_IMAGE_TAG }}"
+          if [ -z "$IMAGE_TAG_BASE" ]; then
+            IMAGE_TAG_BASE="${{ needs.preflight.outputs.comfyui-ref }}"
+          fi
+
+          DOCKERHUB_REPO="${{ inputs.DOCKERHUB_REPO || 'comfy' }}"
+          IMAGE_TAG="${IMAGE_TAG_BASE}-cuda-${CUDA_VERSION}-${PYTHON_VERSION}"
+          STAGING_TAG_BASE="${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+
+          echo "STAGING_TAG_BASE=$STAGING_TAG_BASE" >> $GITHUB_ENV
+
+          echo "Derived staging tag base: $STAGING_TAG_BASE (arch=${{ matrix.arch.suffix }})"
+
+      - name: Build and push arch image to staging
+        uses: ./.github/actions/build-arch-image
+        with:
+          context: derivatives/pytorch/derivatives/comfyui
+          arch: ${{ matrix.arch.platform }}
+          tag-base: ${{ env.STAGING_TAG_BASE }}
+          build-args: |
+            PYTORCH_BASE=${{ matrix.base_image }}
+            COMFYUI_REF=${{ needs.preflight.outputs.comfyui-ref }}
+          dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  # Live-GPU QA gate (ADR 0005) — calls the reusable qa-gate.yml once per
+  # promoted CUDA variant (amd64). All per-image specifics (tag, label, the
+  # SHA-pinned provisioning URL) are here; the shared create -> test -> destroy ->
+  # delete -> verdict core + the account concurrency group live in qa-gate.yml.
+  # amd64-only (ADR 0005 cond 4); advisory until VAST_API_KEY exists.
+  qa:
+    needs: [preflight, build]
+    if: needs.preflight.outputs.should-run == 'true'
+    strategy:
+      fail-fast: false
+      # cuda/py are constants per variant (matching the build matrix), so the
+      # staging tag is built inline below — no per-cell shell derivation.
+      matrix:
+        include:
+          - { cuda: "12.9", py: "py312" }
+          - { cuda: "13.2", py: "py312" }
+    uses: ./.github/workflows/qa-gate.yml
+    with:
+      repo: ${{ inputs.DOCKERHUB_REPO || 'comfy' }}
+      tag: ${{ inputs.CUSTOM_IMAGE_TAG || needs.preflight.outputs.comfyui-ref }}-cuda-${{ matrix.cuda }}-${{ matrix.py }}-amd64
+      template_dir: derivatives/pytorch/derivatives/comfyui/templates/comfyui-qa
+      label: base-image-qa-comfyui
+      log_paths: "/var/log/portal/comfyui.log /var/log/portal/api-wrapper.log"
+      # SHA-pinned so the QA box provisions the workflow on the ref under test.
+      extra_env: "PROVISIONING_COMFYUI_WORKFLOWS=https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/derivatives/pytorch/derivatives/comfyui/templates/comfyui-qa/sd15-txt2img.json"
+      # CI-side half of the template's INSTANCE_TEST_REQUIRE_PASS (ADR 0019/0031).
+      # Declared in BOTH places on purpose: the runner enforces it in-instance, and
+      # this enforces it against the verdict payload, so a template edit that drops
+      # the env var still cannot produce a passing gate.
+      require_tests: "base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries comfyui.d/10-comfyui-serving"
+      # ADR 0029 condition 5: the redraw rule is not forked per image. This gate ran
+      # retries: 0 while base and pytorch ran 2, so a bad host red here blocked a
+      # promote that the same image would have survived on any other image's gate.
+      # A real defect still blocks — it fails every draw — and each failed attempt
+      # records its machine and excludes it from the next.
+      retries: 2
+    secrets:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      DOCKERHUB_NAMESPACE_STAGING: ${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Serverless cell — the FIRST one ComfyUI has ever had. The image has baked
+  # BACKEND=comfyui-json and EXPOSE 3000 for some time and `comfyui.d/20-serverless-pyworker`
+  # has been in the suite the whole while, dormant behind its `is_serverless` guard: the
+  # assertion existed and had never once executed, on any cell, anywhere. That is L067's
+  # shape — a test whose mode is never switched on is not coverage.
+  #
+  # PROVISIONING_COMFYUI_WORKFLOWS is carried over from the standard cell and is NOT
+  # scaffolding here: unlike the LLM engines, whose benchmark payload the worker
+  # synthesises from a model name, comfyui-json benchmarks a real WORKFLOW that
+  # convert-workflows.sh derives from this file. Without it the worker has nothing to
+  # drive and never reaches a score, which is the one thing this cell asserts.
+  #
+  # The worker's contract with this image is hardcoded upstream and matched here:
+  # 127.0.0.1:18288 (api-wrapper's uvicorn), /var/log/portal/api-wrapper.log (derived
+  # from `[program:api-wrapper]`) and /health. None of it is passed as env, because all
+  # of it is the image's own — passing it would test our values instead of the image's.
+  #
+  # IT DOES NOT GATE YET, on the same ramp every other engine's serverless cell uses:
+  # named in merge-manifests' `needs` so it is ORDERED ahead of the production approval
+  # prompt, absent from its `if` so it cannot BLOCK.
+  qa-serverless:
+    needs: [preflight, build]
+    if: needs.preflight.outputs.should-run == 'true'
+    strategy:
+      fail-fast: false
+      # cuda/py are constants per variant (matching the build matrix), so the
+      # staging tag is built inline below — no per-cell shell derivation.
+      matrix:
+        include:
+          - { cuda: "12.9", py: "py312" }
+          - { cuda: "13.2", py: "py312" }
+    uses: ./.github/workflows/qa-gate.yml
+    with:
+      repo: ${{ inputs.DOCKERHUB_REPO || 'comfy' }}
+      tag: ${{ inputs.CUSTOM_IMAGE_TAG || needs.preflight.outputs.comfyui-ref }}-cuda-${{ matrix.cuda }}-${{ matrix.py }}-amd64
+      template_dir: derivatives/pytorch/derivatives/comfyui/templates/comfyui-qa
+      label: base-image-qa-comfyui-serverless
+      log_paths: "/var/log/portal/comfyui.log /var/log/portal/api-wrapper.log"
+      # SHA-pinned so the QA box provisions the workflow on the ref under test.
+      # THE AUTOSCALER'S OWN SIGNALS, NOT SERVERLESS=true (ADR 0034). ONE serverless cell,
+      # exercising the INFERRED path, because that is the strictly harder one: it requires
+      # 01-detect-serverless.sh to run, decide and EXPORT SERVERLESS — and the export to
+      # reach the test runner, since `is_serverless` reads the variable, not the marker
+      # file. A declared SERVERLESS=true arrives via docker -e and is a SUBSET of that, so
+      # a cell passing here would pass there.
+      #
+      # It therefore doubles as the per-image canary for "did this image actually inherit
+      # the stage": a stale base pin yields an image with no 01-detect-serverless.sh,
+      # where a DECLARED cell still passes and this one cannot.
+      #
+      # The declared branch keeps its coverage where it is cheap and exact —
+      # tools/imagegen/tests/test_detect_serverless_sh.py drives the real script through
+      # every branch, including an explicit true and an explicit false, with no GPU.
+      #
+      # Both sentinels are self-evidently fake and safe in plaintext: the stage tests
+      # PRESENCE only and never reads either value, and .invalid cannot resolve. The
+      # MASTER_TOKEN here is not a credential and must never be replaced with one.
+      #
+      # Every test named below opens with `is_serverless || test_skip`, and runner.sh turns
+      # a skipped REQUIRED test into REQUIRED-FAIL — a broken inference is a red cell.
+      extra_env: |
+        MASTER_TOKEN=qa-detection-sentinel-not-a-real-token
+        REPORT_ADDR=https://qa-detection-sentinel.invalid
+        # UNSECURED skips the pubkey gate, and it undoes a QA-only side effect rather
+        # than weakening the test. REPORT_ADDR above is an unresolvable sentinel (L079),
+        # so `GET ${REPORT_ADDR}/pubkey/` CANNOT succeed — five attempts, then
+        # `backend_errored`, on every cell, always. The gate therefore proves nothing
+        # here: it is guaranteed to fail for a reason QA created, and skipping it masks
+        # nothing observable, because no configuration of ours could make it pass.
+        #
+        # What it costs without this: the worker benchmarks fine (`.has_benchmark` is
+        # written at backend.py:857, BEFORE the gate at :915 — which is why these cells
+        # were already green) and then dies at the last step, so every QA worker ends
+        # its life `errored` and each cell burns ~60s waiting for a key that cannot
+        # arrive. Measured on a live 2x5090 debug box: detection worked, sglang served,
+        # benchmark 995.55 written, then "Cannot mark model as loaded: pubkey fetch
+        # failed".
+        #
+        # SCOPE: QA scaffolding, and it must never reach a template — there it would
+        # disable request-signature verification on a live worker (__check_signature
+        # returns True immediately). It lives in extra_env precisely because a
+        # template.yml is what a production template gets copied from. Gated by L080.
+        UNSECURED=true
+        SERVERLESS_DETECT_EXPECT=detected
+        PROVISIONING_COMFYUI_WORKFLOWS=https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/derivatives/pytorch/derivatives/comfyui/templates/comfyui-qa/sd15-txt2img.json
+        INSTANCE_TEST_REQUIRE_PASS=base/15-boot-markers base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries base/85-serverless-services comfyui.d/10-comfyui-serving comfyui.d/20-serverless-pyworker
+      require_tests: "base/15-boot-markers base/60-gpu-cuda base/61-cuda-compute base/62-gpu-libraries base/85-serverless-services comfyui.d/10-comfyui-serving comfyui.d/20-serverless-pyworker"
+      # ADR 0029 condition 5: the redraw rule is not forked per image. This gate ran
+      # retries: 0 while base and pytorch ran 2, so a bad host red here blocked a
+      # promote that the same image would have survived on any other image's gate.
+      # A real defect still blocks — it fails every draw — and each failed attempt
+      # records its machine and excludes it from the next.
+      retries: 2
+    secrets:
+      VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+      DOCKERHUB_NAMESPACE_STAGING: ${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      # start_server.sh: `[ -n "$BACKEND" ] && [ -z "$HF_TOKEN" ] && report_error_and_exit`.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  merge-manifests:
+    # qa-serverless and qa-serverless-detect are in `needs` to ORDER them ahead of the
+    # production approval prompt, and absent from the `if` so they cannot BLOCK — the
+    # advisory ramp every other engine's serverless cell uses.
+    #
+    # `!cancelled()` is what makes that true, and it is not decoration. A job named in
+    # `needs` blocks BY DEFAULT: GitHub implicitly skips a job when anything it needs
+    # fails, so "absent from the if" is not enough on its own. Measured 2026-08-27 —
+    # adding the two cells to `needs` alone silently made them gating, and a config_error
+    # in one skipped merge-manifests for a run whose four other cells were green.
+    # `!cancelled()` switches that implicit skip off, which is why the results that MUST
+    # still block are then named explicitly.
+    needs: [preflight, build, qa, qa-serverless]
+    if: >-
+      !cancelled()
+      && needs.preflight.outputs.should-run == 'true'
+      && needs.build.result == 'success'
+      && needs.qa.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'production' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        base_image:
+          - vastai/pytorch:2.10.0-cu128-cuda-12.9-mini-py312-2026-08-26
+          - vastai/pytorch:2.10.0-cu130-cuda-13.2-mini-py312-2026-08-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Derive image tags
+        run: |
+          PYTORCH_BASE="${{ matrix.base_image }}"
+          TAG="${PYTORCH_BASE##*:}"
+
+          CUDA_VERSION=$(echo "$TAG" | sed -n 's/.*cuda-\([0-9.]*\).*/\1/p')
+          PYTHON_VERSION=$(echo "$TAG" | sed -n 's/.*-py\([0-9]*\).*/py\1/p')
+
+          IMAGE_TAG_BASE="${{ inputs.CUSTOM_IMAGE_TAG }}"
+          if [ -z "$IMAGE_TAG_BASE" ]; then
+            IMAGE_TAG_BASE="${{ needs.preflight.outputs.comfyui-ref }}"
+          fi
+
+          DOCKERHUB_REPO="${{ inputs.DOCKERHUB_REPO || 'comfy' }}"
+          IMAGE_TAG="${IMAGE_TAG_BASE}-cuda-${CUDA_VERSION}-${PYTHON_VERSION}"
+
+          STAGING_TAG_BASE="${{ secrets.DOCKERHUB_NAMESPACE_STAGING }}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+          PROD_TAG="${{ secrets.DOCKERHUB_NAMESPACE }}/${DOCKERHUB_REPO}:${IMAGE_TAG}"
+
+          echo "STAGING_TAG_BASE=$STAGING_TAG_BASE" >> $GITHUB_ENV
+          echo "PROD_TAG=$PROD_TAG" >> $GITHUB_ENV
+
+          MATRIX_ID=$(echo "$PYTORCH_BASE" | md5sum | cut -c1-8)
+          echo "MATRIX_ID=$MATRIX_ID" >> $GITHUB_ENV
+
+      - name: Assemble multi-arch index in production
+        uses: ./.github/actions/merge-arch-manifests
+        with:
+          target-tag: ${{ env.PROD_TAG }}
+          source-tag-base: ${{ env.STAGING_TAG_BASE }}
+          dockerhub-username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Record merged manifest tag
+        run: |
+          mkdir -p built-tags
+          echo "${{ env.PROD_TAG }}" > built-tags/tag-${{ env.MATRIX_ID }}.txt
+
+      - name: Upload manifest tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-tag-${{ env.MATRIX_ID }}
+          path: built-tags/
+          retention-days: 1
+
+  collect-tags:
+    needs: [preflight, build, merge-manifests]
+    if: always() && needs.preflight.outputs.should-run == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      all-tags: ${{ steps.collect.outputs.tags }}
+    steps:
+      - name: Download all tag artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: built-tag-*
+          path: all-tags/
+          merge-multiple: true
+
+      - name: Aggregate tags
+        id: collect
+        run: |
+          if [ -d all-tags ] && [ "$(ls -A all-tags 2>/dev/null)" ]; then
+            # Combine all tag files into JSON array
+            TAGS=$(cat all-tags/*.txt | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "Found tags: $TAGS"
+          else
+            echo "::warning::No tags found - build may have failed"
+            TAGS="[]"
+          fi
+
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
+  notify:
+    needs: [preflight, build, qa, merge-manifests, collect-tags]
+    if: always() && needs.preflight.outputs.should-run == 'true'
+    uses: ./.github/workflows/notify-slack.yml
+    with:
+      build-result: ${{ needs.merge-manifests.result }}
+      # Distinct failure labels via AGGREGATED .result (never matrix .outputs):
+      # build broke vs QA caught a bad image vs promotion (crane) failed. Empty on
+      # success -> notify-slack renders the default "✅ ... Successful". (Soft-pass
+      # is a separate ⚠️ alert fired per-cell inside qa-gate.yml.)
+      # "PROMOTED" IS AN ALLOWLIST ON merge-manifests SUCCEEDING, not a fall-through.
+      # This expression used to enumerate failure states and fall through to the
+      # success text keyed on `qa.outputs.gated` — "did a live test run" — which says
+      # nothing about whether anything shipped. `merge-manifests` ending 'skipped' or
+      # 'cancelled' is not 'failure', so it fell through and Slack announced a
+      # promotion that did not happen. Measured 2026-08-27: three branch dispatches
+      # cancelled at the production approval gate, every QA cell green, Slack saying
+      # "ComfyUI promoted — live-GPU QA passed" beside a red run card.
+      headline: ${{ (needs.build.result != 'success' && 'ComfyUI build failed') || (needs.qa.result == 'failure' && 'ComfyUI QA FAILED on real GPU — not promoted') || (needs.merge-manifests.result == 'failure' && 'ComfyUI promotion (manifest merge) failed') || (needs.merge-manifests.result != 'success' && 'ComfyUI NOT promoted — promotion did not run') || (needs.qa.outputs.gated == 'true' && 'ComfyUI promoted — live-GPU QA passed') || '' }}
+      image-name: "ComfyUI"
+      image-ref: ${{ needs.preflight.outputs.comfyui-ref }}
+      image-tags: ${{ needs.collect-tags.outputs.all-tags }}
+      trigger: ${{ github.event_name }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
