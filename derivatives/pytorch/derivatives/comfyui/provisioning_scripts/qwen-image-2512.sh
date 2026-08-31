@@ -1,4 +1,12 @@
 #!/bin/bash
+#
+# Qwen-Image-2512 text-to-image.
+#
+#   https://docs.comfy.org/tutorials/image/qwen/qwen-image-2512
+#
+# Every node this template uses is comfy-core, so no custom nodes are cloned.
+#
+# Disk: ~32GB of weights, so give the instance 60GB+.
 
 set -euo pipefail
 

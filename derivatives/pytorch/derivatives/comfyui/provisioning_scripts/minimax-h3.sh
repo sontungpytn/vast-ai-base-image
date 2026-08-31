@@ -1,14 +1,13 @@
 #!/bin/bash
 #
-# Qwen-Image-2512 (text to image) + MiniMax-H3 (text/image to video).
+# MiniMax-H3 text-to-video and image-to-video.
 #
-#   https://docs.comfy.org/tutorials/image/qwen/qwen-image-2512
 #   https://docs.comfy.org/tutorials/video/minimax/minimax-h3
 #
 # Every node these templates use is comfy-core, so no custom nodes are cloned.
-# MiniMax-H3 needs ComfyUI >= 0.30.0, which the image's COMFYUI_REF satisfies.
+# H3 needs ComfyUI >= 0.30.0, which the image's COMFYUI_REF satisfies.
 #
-# Disk: ~76GB of weights, so give the instance 120GB+. The reference-to-video
+# Disk: ~45GB of weights, so give the instance 80GB+. The reference-to-video
 # (R2V) workflow is left out because its diffusion model is a second 21GB file
 # on top of the one T2V and I2V share - uncomment the R2V block to add it.
 
@@ -28,21 +27,7 @@ MODEL_LOG="${MODEL_LOG:-/var/log/portal/comfyui.log}"
 # Model declarations: "URL|OUTPUT_PATH"
 # Filenames are the ones the templates load by name - do not rename them.
 HF_MODELS=(
-    # --- Qwen-Image-2512 ---
-    "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors
-    |$MODELS_DIR/diffusion_models/qwen_image_2512_fp8_e4m3fn.safetensors"
-
-    "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors
-    |$MODELS_DIR/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
-
-    "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors
-    |$MODELS_DIR/vae/qwen_image_vae.safetensors"
-
-    # 4-step Lightning LoRA feeding the template's speed branch
-    "https://huggingface.co/lightx2v/Qwen-Image-2512-Lightning/resolve/main/Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors
-    |$MODELS_DIR/loras/Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
-
-    # --- MiniMax-H3 (T2V + I2V) ---
+    # T2V and I2V share this one
     "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
     |$MODELS_DIR/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
 
@@ -59,7 +44,7 @@ HF_MODELS=(
     "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors
     |$MODELS_DIR/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"
 
-    # --- MiniMax-H3 reference-to-video (adds ~23GB) ---
+    # --- Reference-to-video (adds ~23GB) ---
     #"https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
     #|$MODELS_DIR/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
     #"https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors
@@ -70,9 +55,6 @@ HF_MODELS=(
 # GUI workflows are pulled from the template repo rather than embedded; the
 # api-wrapper converts everything in WORKFLOWS_DIR to API payloads on start.
 WGET_DOWNLOADS=(
-    "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/image_qwen_Image_2512.json
-    |$WORKFLOWS_DIR/image_qwen_Image_2512.json"
-
     "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/templates/video_minimax_h3_t2v.json
     |$WORKFLOWS_DIR/video_minimax_h3_t2v.json"
 
@@ -308,7 +290,7 @@ release_slot() {
     rm -f "$1"
 }
 main() {
-    log "Starting Qwen-Image-2512 + MiniMax-H3 provisioning..."
+    log "Starting MiniMax-H3 provisioning..."
 
     # Activate virtual environment if it exists
     if [ -f /venv/main/bin/activate ]; then
